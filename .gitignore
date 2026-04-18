@@ -1,0 +1,6 @@
+/target
+/result
+/result-*
+/out
+flake.lock
+test-bundle/
