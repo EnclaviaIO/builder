@@ -69,6 +69,12 @@
           ociBundlePath = oci-bundle;
         };
 
+        enclave-debug = pkgs.callPackage ./nix/enclave.nix {
+          inherit pkgs nitroLib enclaviaServerPkg;
+          ociBundlePath = oci-bundle;
+          debugMode = true;
+        };
+
         # --- Debug VM launcher ---
         # Wraps the EIF with a script that launches QEMU nitro-enclave locally.
         # Handles vhost-device-vsock setup and heartbeat responding.
@@ -143,6 +149,12 @@
           ociBundlePath = test-bundle;
         };
 
+        test-enclave-debug = pkgs.callPackage ./nix/enclave.nix {
+          inherit pkgs nitroLib enclaviaServerPkg;
+          ociBundlePath = test-bundle;
+          debugMode = true;
+        };
+
         test-debug-vm = pkgs.writeShellScriptBin "enclavia-test-debug-vm" ''
           set -euo pipefail
 
@@ -203,7 +215,7 @@
       in
       {
         packages = {
-          inherit builder enclave debug-vm test-bundle test-enclave test-debug-vm;
+          inherit builder enclave enclave-debug debug-vm test-bundle test-enclave test-enclave-debug test-debug-vm;
           default = builder;
         };
 

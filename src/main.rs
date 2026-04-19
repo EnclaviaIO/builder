@@ -46,6 +46,14 @@ enum Cli {
         /// Directory to write output artifacts (image.eif, pcr.json)
         #[arg(long, default_value = "./out")]
         output_dir: PathBuf,
+
+        /// Port the customer's container listens on inside the enclave
+        #[arg(long, default_value = "8080")]
+        container_port: u16,
+
+        /// Build for debug mode (QEMU with patched init using CID 2)
+        #[arg(long)]
+        debug: bool,
     },
 }
 
@@ -99,6 +107,11 @@ async fn pull_image(image: &str, dest: &Path, creds: Option<(&str, &str)>) -> Re
 
     let mut args = vec!["copy", &src, &dst];
 
+    // Disable TLS verification for localhost registries (dev/test).
+    if image.starts_with("localhost:") || image.starts_with("127.0.0.1:") {
+        args.push("--src-tls-verify=false");
+    }
+
     let creds_str;
     if let Some((user, pass)) = creds {
         creds_str = format!("{user}:{pass}");
@@ -118,6 +131,7 @@ async fn unpack_bundle(oci_layout: &Path, bundle_dir: &Path) -> Result<()> {
         "umoci",
         &[
             "unpack",
+            "--rootless",
             "--image",
             &image_arg,
             &bundle_dir.to_string_lossy(),
@@ -131,30 +145,76 @@ async fn unpack_bundle(oci_layout: &Path, bundle_dir: &Path) -> Result<()> {
 
 /// Patch the OCI bundle config for enclave compatibility.
 ///
-/// Removes the "mount" namespace from the OCI config because the enclave runs on
-/// an initramfs rootfs that doesn't support mount propagation changes (EINVAL).
-/// This is safe because there's only a single container inside the enclave.
+/// The enclave runs a single container as root on an initramfs. Namespace
+/// isolation adds no value and several types (cgroup, mount) are incompatible
+/// with the minimal nitro-enclave kernel. We also remove the UID/GID mappings
+/// that `umoci --rootless` generates, since they map container root to the
+/// build user (UID 1000) rather than the enclave's real root (UID 0).
 fn patch_bundle_config(bundle_dir: &Path) -> Result<()> {
     let config_path = bundle_dir.join("config.json");
     let content = std::fs::read_to_string(&config_path)?;
     let mut config: serde_json::Value = serde_json::from_str(&content)?;
 
+    // Remove ALL namespaces — the enclave kernel lacks cgroup namespace support
+    // and mount namespace fails on initramfs. PID/IPC/UTS/user are unnecessary.
     if let Some(namespaces) = config
         .pointer_mut("/linux/namespaces")
         .and_then(|v| v.as_array_mut())
     {
         let before = namespaces.len();
-        namespaces.retain(|ns| {
-            ns.get("type").and_then(|t| t.as_str()) != Some("mount")
-        });
-        let removed = before - namespaces.len();
-        if removed > 0 {
-            info!(removed, "stripped mount namespace(s) from OCI config");
+        namespaces.clear();
+        if before > 0 {
+            info!(removed = before, "stripped all namespaces from OCI config");
+        }
+    }
+
+    // Remove rootless UID/GID mappings — we run as real root in the enclave,
+    // not as the unprivileged build user these mappings target.
+    if let Some(linux) = config.pointer_mut("/linux").and_then(|v| v.as_object_mut()) {
+        linux.remove("uidMappings");
+        linux.remove("gidMappings");
+    }
+
+    // Remove hostname — setting it requires the UTS namespace, which we strip.
+    if let Some(obj) = config.as_object_mut() {
+        obj.remove("hostname");
+    }
+
+    // Disable terminal — crun needs devpts to allocate a pty, which isn't
+    // available on initramfs. With terminal=false, the container's stdout/stderr
+    // go directly to the init script's file descriptors.
+    if let Some(terminal) = config.pointer_mut("/process/terminal") {
+        *terminal = serde_json::Value::Bool(false);
+    }
+
+    // Strip all mounts — without mount namespace, crun tries to mount in the
+    // global namespace on initramfs, which fails for cgroups, devpts, bind-mounts
+    // of /etc/resolv.conf, etc. Essential filesystems (proc, dev, sys, tmp) are
+    // pre-mounted by the init script instead.
+    if let Some(mounts) = config
+        .pointer_mut("/mounts")
+        .and_then(|v| v.as_array_mut())
+    {
+        let before = mounts.len();
+        mounts.clear();
+        if before > 0 {
+            info!(removed = before, "stripped all mounts from OCI config");
         }
     }
 
     let patched = serde_json::to_string_pretty(&config)?;
     std::fs::write(&config_path, patched)?;
+
+    // Ensure /etc/resolv.conf exists in the container rootfs.
+    // Docker normally bind-mounts this, but crun on initramfs doesn't.
+    // Without it, some images (e.g. nginx) fail to start.
+    let resolv = bundle_dir.join("rootfs/etc/resolv.conf");
+    if !resolv.exists() {
+        std::fs::create_dir_all(bundle_dir.join("rootfs/etc"))?;
+        std::fs::write(&resolv, "nameserver 127.0.0.1\n")?;
+        info!("created missing /etc/resolv.conf in container rootfs");
+    }
+
     Ok(())
 }
 
@@ -163,16 +223,27 @@ async fn build_eif(
     bundle_dir: &Path,
     enclavia_server_dir: &Path,
     result_link: &Path,
+    debug: bool,
 ) -> Result<()> {
     let bundle_arg = format!("path:{}", bundle_dir.display());
     let server_arg = format!("path:{}", enclavia_server_dir.display());
     let out_arg = result_link.to_string_lossy();
 
+    // Resolve the builder's own directory so `nix build` finds the correct flake
+    // regardless of the working directory.
+    let builder_dir = std::env::current_exe()?
+        .parent()
+        .and_then(|p| p.parent()) // target/release -> target -> builder root
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let target = if debug { "enclave-debug" } else { "enclave" };
+    let flake_ref = format!("{}#{}", builder_dir.display(), target);
+
     run_cmd(
         "nix",
         &[
             "build",
-            ".#enclave",
+            &flake_ref,
             "--override-input",
             "oci-bundle",
             &bundle_arg,
@@ -211,11 +282,30 @@ fn copy_artifacts(result_dir: &Path, output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Write the enclavia config into the bundle so enclave.nix picks it up.
+fn write_enclavia_config(bundle_dir: &Path, container_port: u16) -> Result<()> {
+    let config = serde_json::json!({
+        "listen_vsock_port": 5000,
+        "oci_bundle_path": "/var/lib/oci/bundle",
+        "customer_app": {
+            "port": container_port,
+            "health_check": "/health",
+            "startup_timeout_secs": 30
+        }
+    });
+    let path = bundle_dir.join("enclavia-config.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap())?;
+    info!(container_port, "wrote enclavia config");
+    Ok(())
+}
+
 async fn build(
     image: &str,
     creds: Option<(&str, &str)>,
     enclavia_server_dir: &Path,
     output_dir: &Path,
+    container_port: u16,
+    debug: bool,
 ) -> Result<BuildResult> {
     let tmp = tempfile::tempdir()?;
     let tmp_path = tmp.path();
@@ -243,15 +333,18 @@ async fn build(
     // 3. Patch OCI config for enclave compatibility
     patch_bundle_config(&bundle_dir)?;
 
-    // 4. Build the EIF
-    info!("building enclave image");
-    build_eif(&bundle_dir, &enclavia_server_abs, &result_link).await?;
+    // 4. Write enclavia config into bundle
+    write_enclavia_config(&bundle_dir, container_port)?;
 
-    // 5. Read PCR values
+    // 5. Build the EIF
+    info!("building enclave image");
+    build_eif(&bundle_dir, &enclavia_server_abs, &result_link, debug).await?;
+
+    // 6. Read PCR values
     let pcrs = read_pcrs(&result_link)?;
     info!(pcr0 = %pcrs.pcr0, pcr1 = %pcrs.pcr1, pcr2 = %pcrs.pcr2, "PCR values");
 
-    // 6. Copy artifacts to output
+    // 7. Copy artifacts to output
     copy_artifacts(&result_link, output_dir)?;
 
     Ok(BuildResult {
@@ -263,6 +356,7 @@ async fn build(
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info".parse().unwrap()),
@@ -278,13 +372,15 @@ async fn main() {
             registry_password,
             enclavia_server_dir,
             output_dir,
+            container_port,
+            debug,
         } => {
             let creds = match (&registry_user, &registry_password) {
                 (Some(u), Some(p)) => Some((u.as_str(), p.as_str())),
                 _ => None,
             };
 
-            match build(&image, creds, &enclavia_server_dir, &output_dir).await {
+            match build(&image, creds, &enclavia_server_dir, &output_dir, container_port, debug).await {
                 Ok(result) => {
                     let json = serde_json::to_string_pretty(&result).unwrap();
                     println!("{json}");

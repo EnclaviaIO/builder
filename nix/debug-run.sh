@@ -3,13 +3,12 @@
 # Launch an Enclavia enclave EIF in QEMU for local testing.
 #
 # Requires:
-#   - qemu-system-x86_64 (with nitro-enclave support: libcbor + gnutls)
-#   - vhost-device-vsock  (cargo install vhost-device-vsock, or from nixpkgs)
+#   - qemu-system-x86_64 >= 9.2 (nitro-enclave machine type)
+#   - vhost-device-vsock  (cargo install vhost-device-vsock)
 #   - python3             (for the heartbeat responder)
-#   - KVM access          (/dev/kvm)
+#   - KVM access          (/dev/kvm) — or omit --enable-kvm for TCG (slow)
 #
-# The enclave's vsock port 5000 (enclavia-server) is forwarded to a unix
-# socket so host-side software can connect to it for testing.
+# See docs/debug-qemu.md for full setup instructions.
 
 set -euo pipefail
 
@@ -22,11 +21,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SOCK_DIR="$(mktemp -d /tmp/enclave-debug.XXXXXX)"
 
 VHOST_SOCKET="${SOCK_DIR}/vhost.sock"
-UDS_PREFIX="${SOCK_DIR}/v"
 
 cleanup() {
     echo "debug-run: cleaning up..."
-    # Kill background processes
     kill "${HEARTBEAT_PID:-}" "${VHOST_PID:-}" 2>/dev/null || true
     wait "${HEARTBEAT_PID:-}" "${VHOST_PID:-}" 2>/dev/null || true
     rm -rf "${SOCK_DIR}"
@@ -38,14 +35,13 @@ echo "debug-run: EIF        = ${EIF_PATH}"
 echo "debug-run: memory     = ${MEMORY}, cpus = ${CPUS}"
 
 # --- 1. Start vhost-device-vsock ---
-# Guest connections to any port are forwarded to unix sockets at ${UDS_PREFIX}_${PORT}.
-# Host connections to ${UDS_PREFIX}_${PORT} are forwarded to the guest on that port.
+# --forward-cid=1 forwards guest vsock connections to the host's AF_VSOCK,
+# allowing the heartbeat responder and other host services to listen normally.
 echo "debug-run: starting vhost-device-vsock (CID ${GUEST_CID})..."
 vhost-device-vsock \
-    --vm "guest-cid=${GUEST_CID},socket=${VHOST_SOCKET},uds-path=${UDS_PREFIX}" &
+    --vm "guest-cid=${GUEST_CID},socket=${VHOST_SOCKET},forward-cid=1" &
 VHOST_PID=$!
 
-# Wait for the vhost socket to appear
 for i in $(seq 1 50); do
     [ -S "${VHOST_SOCKET}" ] && break
     sleep 0.1
@@ -57,15 +53,16 @@ fi
 
 # --- 2. Start heartbeat responder ---
 # The enclave init sends 0xB7 to CID 3 port 9000 and expects 0xB7 back.
+# Listens on AF_VSOCK (VMADDR_CID_ANY, port 9000).
 echo "debug-run: starting heartbeat responder..."
-python3 "${SCRIPT_DIR}/heartbeat.py" "${UDS_PREFIX}_9000" &
+python3 "${SCRIPT_DIR}/heartbeat.py" &
 HEARTBEAT_PID=$!
 
 # --- 3. Launch QEMU ---
 echo "debug-run: launching QEMU..."
 echo ""
-echo "  Enclave vsock port 5000 is forwarded to: ${UDS_PREFIX}_5000"
-echo "  Connect host-side software to that unix socket for testing."
+echo "  Enclave vsock CID:  ${GUEST_CID}"
+echo "  Enclave vsock port: 5000 (enclavia-server)"
 echo ""
 
 qemu-system-x86_64 \
