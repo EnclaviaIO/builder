@@ -14,8 +14,8 @@ if [ -f "$CONFIG" ]; then
                 # Extract number after "port": — handles "port": 3000 or "port":3000
                 port="${line#*\"port\"}"
                 port="${port#*:}"
+                port="${port#"${port%%[! ]*}"}"
                 port="${port%%[!0-9]*}"
-                port="$(echo $port)"
                 if [ -n "$port" ] && [ "$port" -gt 0 ] 2>/dev/null; then
                     CONTAINER_PORT="$port"
                 fi

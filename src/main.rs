@@ -187,6 +187,23 @@ fn patch_bundle_config(bundle_dir: &Path) -> Result<()> {
         *terminal = serde_json::Value::Bool(false);
     }
 
+    // Grant all capabilities — the enclave is the security boundary, not the
+    // container. Without CAP_DAC_OVERRIDE, the container process (UID 0) can't
+    // write to files owned by the build user (UID 1000 from umoci --rootless).
+    let all_caps: serde_json::Value = serde_json::json!([
+        "CAP_AUDIT_WRITE", "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH",
+        "CAP_FOWNER", "CAP_FSETID", "CAP_KILL", "CAP_MKNOD", "CAP_NET_BIND_SERVICE",
+        "CAP_NET_RAW", "CAP_SETFCAP", "CAP_SETGID", "CAP_SETPCAP", "CAP_SETUID",
+        "CAP_SYS_CHROOT"
+    ]);
+    if let Some(caps) = config.pointer_mut("/process/capabilities") {
+        if let Some(obj) = caps.as_object_mut() {
+            for key in &["bounding", "effective", "inheritable", "permitted", "ambient"] {
+                obj.insert(key.to_string(), all_caps.clone());
+            }
+        }
+    }
+
     // Strip all mounts — without mount namespace, crun tries to mount in the
     // global namespace on initramfs, which fails for cgroups, devpts, bind-mounts
     // of /etc/resolv.conf, etc. Essential filesystems (proc, dev, sys, tmp) are
