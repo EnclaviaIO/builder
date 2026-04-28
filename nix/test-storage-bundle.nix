@@ -79,23 +79,6 @@ let
     ];
   });
 
-  # Config that tells enclavia-server + init about the container port
-  enclaviaConfig = pkgs.writeText "enclavia-config.json" (builtins.toJSON {
-    listen_vsock_port = 5000;
-    oci_bundle_path = "/var/lib/oci/bundle";
-    customer_app = {
-      port = 8080;
-      health_check = "/health";
-      startup_timeout_secs = 30;
-    };
-    storage = {
-      enabled = true;
-      vsock_port = 5001;
-      mount_point = "/data";
-      device = "/dev/nbd0";
-    };
-  });
-
 in pkgs.runCommand "test-storage-oci-bundle" {} ''
   mkdir -p $out/rootfs/bin $out/rootfs/tmp $out/rootfs/data
 
@@ -107,6 +90,6 @@ in pkgs.runCommand "test-storage-oci-bundle" {} ''
 
   cp ${config} $out/config.json
 
-  # Override enclavia config with storage-enabled version
-  cp ${enclaviaConfig} $out/enclavia-config.json
+  # No enclavia-config.json override — enclave.nix auto-generates a config
+  # with the appropriate storage + kms_key_id when storageEnabled = true.
 ''

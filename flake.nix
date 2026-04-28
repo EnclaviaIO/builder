@@ -69,7 +69,12 @@
         # --- Enclave EIF ---
         enclaviaServerPkg = enclavia-server.packages.${system}.enclavia-server-enclave;
         nbdClientPkg = nbd-client.packages.${system}.nbd-client-enclave;
+        enclaviaCryptoPkg = nbd-client.packages.${system}.enclavia-crypto-enclave;
+        mockKmsPkg = nbd-client.packages.${system}.mock-kms;
         nitroLib = nitro-util.lib.${system};
+
+        # Test KMS key ID — only used by mock-kms in test-storage-vm.
+        testKmsKeyId = "test-key-001";
 
         # Custom kernel with NBD block device support for storage-enabled enclaves.
         # Based on the minimal AWS nitro kernel config (~1000 options) with
@@ -98,17 +103,19 @@
         };
 
         enclave-storage = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg;
           ociBundlePath = oci-bundle;
           storageEnabled = true;
+          kmsKeyId = testKmsKeyId;
           customKernel = storageKernel;
         };
 
         enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg;
           ociBundlePath = oci-bundle;
           debugMode = true;
           storageEnabled = true;
+          kmsKeyId = testKmsKeyId;
           customKernel = storageKernel;
         };
 
@@ -196,14 +203,16 @@
         test-storage-bundle = pkgs.callPackage ./nix/test-storage-bundle.nix { inherit pkgs; };
 
         test-enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg;
           ociBundlePath = test-storage-bundle;
           debugMode = true;
           storageEnabled = true;
+          kmsKeyId = testKmsKeyId;
           customKernel = storageKernel;
         };
 
         storageHostBin = "${nbd-client.packages.${system}.storage-host-debug or (throw "storage-host not built — override nbd-client input")}/bin/enclavia-storage";
+        mockKmsBin = "${mockKmsPkg}/bin/enclavia-mock-kms";
 
         test-storage-vm = pkgs.writeShellScriptBin "enclavia-test-storage-vm" ''
           set -euo pipefail
@@ -217,13 +226,17 @@
           VHOST_SOCKET="''${SOCK_DIR}/vhost.sock"
           PROXY_SOCKET="''${SOCK_DIR}/proxy.sock"
           BACKING_FILE="''${SOCK_DIR}/disk.img"
+          KEY_DIR="''${SOCK_DIR}/kms-keys"
           STORAGE_VSOCK_PORT=5001
+          META_VSOCK_PORT=5002
+          KMS_VSOCK_PORT=5003
+          KMS_KEY_ID="${testKmsKeyId}"
 
           cleanup() {
               echo ""
               echo "storage-test-vm: cleaning up..."
-              kill "''${HEARTBEAT_PID:-}" "''${VHOST_PID:-}" "''${STORAGE_PID:-}" 2>/dev/null || true
-              wait "''${HEARTBEAT_PID:-}" "''${VHOST_PID:-}" "''${STORAGE_PID:-}" 2>/dev/null || true
+              kill "''${HEARTBEAT_PID:-}" "''${VHOST_PID:-}" "''${STORAGE_PID:-}" "''${MOCK_KMS_PID:-}" 2>/dev/null || true
+              wait "''${HEARTBEAT_PID:-}" "''${VHOST_PID:-}" "''${STORAGE_PID:-}" "''${MOCK_KMS_PID:-}" 2>/dev/null || true
               # Check if the backing file has data (non-zero blocks = I/O happened)
               if [ -f "''${BACKING_FILE}" ]; then
                   BLOCKS=$(${pkgs.coreutils}/bin/stat --format=%b "''${BACKING_FILE}")
@@ -271,30 +284,58 @@
               ${pkgs.coreutils}/bin/sleep 0.1
           done
 
-          # 3. Start storage daemon.
-          # Guest CID 2:5001 maps to ''${PROXY_SOCKET}_5001
+          # 3. Pre-write the bootstrap key blob to the first 4KB of the backing file.
+          # The backend would do this in production; in dev we synthesize it here.
+          echo "storage-test-vm: writing bootstrap key blob..."
+          ${pkgs.coreutils}/bin/printf '%s' '{"version":1,"kms_key_id":"'"''${KMS_KEY_ID}"'"}' > "''${BACKING_FILE}"
+          ${pkgs.coreutils}/bin/truncate -s 4096 "''${BACKING_FILE}"
+
+          # 4. Start storage daemon (NBD on 5001, key-blob on 5002).
           echo "storage-test-vm: starting storage daemon (backing=''${BACKING_FILE}, 64M)..."
           BACKING_FILE="''${BACKING_FILE}" \
           DISK_SIZE="64M" \
           LISTEN_PATH="''${PROXY_SOCKET}_''${STORAGE_VSOCK_PORT}" \
+          META_LISTEN_PATH="''${PROXY_SOCKET}_''${META_VSOCK_PORT}" \
           RUST_LOG=info \
               ${storageHostBin} &
           STORAGE_PID=$!
 
           for i in $(${pkgs.coreutils}/bin/seq 1 50); do
-              [ -S "''${PROXY_SOCKET}_''${STORAGE_VSOCK_PORT}" ] && break
+              [ -S "''${PROXY_SOCKET}_''${STORAGE_VSOCK_PORT}" ] \
+                  && [ -S "''${PROXY_SOCKET}_''${META_VSOCK_PORT}" ] \
+                  && break
               ${pkgs.coreutils}/bin/sleep 0.1
           done
-          if [ ! -S "''${PROXY_SOCKET}_''${STORAGE_VSOCK_PORT}" ]; then
-              echo "storage-test-vm: ERROR: storage daemon socket not ready" >&2
+          if [ ! -S "''${PROXY_SOCKET}_''${STORAGE_VSOCK_PORT}" ] \
+              || [ ! -S "''${PROXY_SOCKET}_''${META_VSOCK_PORT}" ]; then
+              echo "storage-test-vm: ERROR: storage daemon sockets not ready" >&2
               exit 1
           fi
           echo "storage-test-vm: storage daemon ready"
 
-          # 4. Launch QEMU
+          # 5. Start mock-kms (UDS at PROXY_SOCKET_5003 so guest CID 2:5003 reaches it).
+          echo "storage-test-vm: starting mock-kms (key_dir=''${KEY_DIR})..."
+          ${pkgs.coreutils}/bin/mkdir -p "''${KEY_DIR}"
+          LISTEN_PATH="''${PROXY_SOCKET}_''${KMS_VSOCK_PORT}" \
+          KEY_DIR="''${KEY_DIR}" \
+          RUST_LOG=info \
+              ${mockKmsBin} &
+          MOCK_KMS_PID=$!
+
+          for i in $(${pkgs.coreutils}/bin/seq 1 50); do
+              [ -S "''${PROXY_SOCKET}_''${KMS_VSOCK_PORT}" ] && break
+              ${pkgs.coreutils}/bin/sleep 0.1
+          done
+          if [ ! -S "''${PROXY_SOCKET}_''${KMS_VSOCK_PORT}" ]; then
+              echo "storage-test-vm: ERROR: mock-kms socket not ready" >&2
+              exit 1
+          fi
+          echo "storage-test-vm: mock-kms ready"
+
+          # 6. Launch QEMU
           echo ""
           echo "  Watch the console output for 'storage-test:' messages."
-          echo "  The enclave will mount /data via NBD and write test files."
+          echo "  The enclave will mount LUKS-encrypted /data via NBD and write test files."
           echo "  Press Ctrl-C to stop."
           echo ""
 

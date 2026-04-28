@@ -6,7 +6,9 @@
   containerPort ? 8080,
   debugMode ? false,
   nbdClientPkg ? null,
+  enclaviaCryptoPkg ? null,
   storageEnabled ? false,
+  kmsKeyId ? null,
   customKernel ? null,
 }:
 
@@ -44,8 +46,13 @@ let
       storage = {
         enabled = true;
         vsock_port = 5001;
+        meta_vsock_port = 5002;
+        kms_vsock_port = 5003;
         mount_point = "/data";
         device = "/dev/nbd0";
+        kms_key_id = if kmsKeyId != null
+          then kmsKeyId
+          else throw "kmsKeyId is required when storageEnabled = true";
       };
     } else {})));
 
@@ -66,10 +73,19 @@ let
     ln -s busybox $out/bin/sleep
     ln -s busybox $out/bin/insmod
     ln -s busybox $out/bin/sh
+    ln -s busybox $out/bin/rm
 
     ${if storageEnabled && nbdClientPkg != null then ''
     # NBD client for enclave storage
     cp ${nbdClientPkg}/bin/enclavia-nbd-client $out/bin/
+
+    # KMS / LUKS key management
+    ${if enclaviaCryptoPkg != null then ''
+      cp ${enclaviaCryptoPkg}/bin/enclavia-crypto $out/bin/
+    '' else throw "enclaviaCryptoPkg is required when storageEnabled = true"}
+
+    # cryptsetup for LUKS — must be statically linked.
+    cp ${pkgs.pkgsStatic.cryptsetup}/bin/cryptsetup $out/bin/
 
     # Filesystem tools for first-time format
     cp ${pkgs.pkgsStatic.e2fsprogs}/bin/mkfs.ext4 $out/bin/

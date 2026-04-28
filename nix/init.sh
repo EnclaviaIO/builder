@@ -75,11 +75,28 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
 
     read -r size < /sys/block/nbd0/size 2>/dev/null
     if [ -n "$size" ] && [ "$size" -gt 0 ] 2>/dev/null; then
-        # Format on first use (no existing filesystem), then mount
-        /bin/blkid /dev/nbd0 >/dev/null 2>&1 || /bin/mkfs.ext4 -q /dev/nbd0
+        # Get/create LUKS passphrase via KMS (writes /tmp/luks.key).
+        /bin/enclavia-crypto init
+
+        # Format on first use, then unlock.
+        # --pbkdf-memory caps Argon2id at 64MB (default ~1GB OOMs in small enclaves).
+        if ! /bin/cryptsetup isLuks /dev/nbd0 2>/dev/null; then
+            /bin/cryptsetup luksFormat \
+                --batch-mode \
+                --pbkdf-memory 65536 \
+                --key-file /tmp/luks.key \
+                /dev/nbd0
+        fi
+        /bin/cryptsetup luksOpen --key-file /tmp/luks.key /dev/nbd0 encdata
+
+        # Remove plaintext key — must not be accessible to customer code.
+        # The upgrade flow re-decrypts via KMS rather than reading this file.
+        /bin/rm -f /tmp/luks.key
+
+        /bin/blkid /dev/mapper/encdata >/dev/null 2>&1 || /bin/mkfs.ext4 -q /dev/mapper/encdata
         /bin/mkdir -p /data
-        /bin/mount /dev/nbd0 /data
-        echo "storage: /dev/nbd0 mounted at /data"
+        /bin/mount /dev/mapper/encdata /data
+        echo "storage: encrypted volume mounted at /data"
 
         # Bind-mount into container rootfs so the app can access it
         /bin/mkdir -p "$ROOTFS/data"
