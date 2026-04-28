@@ -68,6 +68,13 @@ enum Cli {
         /// policy is bound to the EIF's PCRs.
         #[arg(long)]
         kms_key_id: Option<String>,
+
+        /// Base64-encoded Ed25519 public key (32 raw bytes) for the management
+        /// control channel. When set, enclavia-server will accept signed
+        /// `Control` commands from the backend; when absent the channel is
+        /// disabled. Required for the upgrade flow.
+        #[arg(long)]
+        control_pubkey: Option<String>,
     },
 }
 
@@ -324,11 +331,29 @@ fn copy_artifacts(result_dir: &Path, output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Validate that a base64-encoded Ed25519 public key decodes to exactly
+/// 32 bytes. We don't verify it's a valid curve point — enclavia-server
+/// re-parses it via ed25519-dalek at boot, which catches that.
+fn validate_control_pubkey(b64: &str) -> std::result::Result<(), String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|e| format!("invalid base64: {e}"))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "expected 32 bytes (raw Ed25519 public key), got {}",
+            bytes.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Write the enclavia config into the bundle so enclave.nix picks it up.
 fn write_enclavia_config(
     bundle_dir: &Path,
     container_port: u16,
     storage_kms_key_id: Option<&str>,
+    control_pubkey: Option<&str>,
 ) -> Result<()> {
     let mut config = serde_json::json!({
         "listen_vsock_port": 5000,
@@ -352,11 +377,16 @@ fn write_enclavia_config(
         });
     }
 
+    if let Some(pubkey) = control_pubkey {
+        config["control_public_key"] = serde_json::Value::String(pubkey.to_string());
+    }
+
     let path = bundle_dir.join("enclavia-config.json");
     std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap())?;
     info!(
         container_port,
         storage = storage_kms_key_id.is_some(),
+        control_channel = control_pubkey.is_some(),
         "wrote enclavia config"
     );
     Ok(())
@@ -371,6 +401,7 @@ async fn build(
     debug: bool,
     storage: bool,
     kms_key_id: Option<&str>,
+    control_pubkey: Option<&str>,
 ) -> Result<BuildResult> {
     let tmp = tempfile::tempdir()?;
     let tmp_path = tmp.path();
@@ -400,7 +431,7 @@ async fn build(
 
     // 4. Write enclavia config into bundle
     let storage_kms_key_id = if storage { kms_key_id } else { None };
-    write_enclavia_config(&bundle_dir, container_port, storage_kms_key_id)?;
+    write_enclavia_config(&bundle_dir, container_port, storage_kms_key_id, control_pubkey)?;
 
     // 5. Build the EIF
     info!(storage, "building enclave image");
@@ -442,6 +473,7 @@ async fn main() {
             debug,
             storage,
             kms_key_id,
+            control_pubkey,
         } => {
             let creds = match (&registry_user, &registry_password) {
                 (Some(u), Some(p)) => Some((u.as_str(), p.as_str())),
@@ -453,6 +485,13 @@ async fn main() {
                 std::process::exit(2);
             }
 
+            if let Some(ref pk) = control_pubkey {
+                if let Err(e) = validate_control_pubkey(pk) {
+                    error!(%e, "--control-pubkey rejected");
+                    std::process::exit(2);
+                }
+            }
+
             match build(
                 &image,
                 creds,
@@ -462,6 +501,7 @@ async fn main() {
                 debug,
                 storage,
                 kms_key_id.as_deref(),
+                control_pubkey.as_deref(),
             )
             .await
             {
