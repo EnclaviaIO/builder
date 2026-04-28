@@ -1,0 +1,12 @@
+--- a/drivers/block/nbd.c
++++ b/drivers/block/nbd.c
+@@ -1020,7 +1020,8 @@ static struct socket *nbd_get_socket(struct nbd_device *nbd, unsigned long fd,
+ 		return NULL;
+
+ 	if (!sk_is_tcp(sock->sk) &&
+-	    !sk_is_stream_unix(sock->sk)) {
++	    !sk_is_stream_unix(sock->sk) &&
++	    !(sock->sk->sk_family == AF_VSOCK && sock->sk->sk_type == SOCK_STREAM)) {
+ 		dev_err(disk_to_dev(nbd->disk), "Unsupported socket: should be TCP or UNIX.\n");
+ 		*err = -EINVAL;
+ 		sockfd_put(sock);

@@ -5,6 +5,9 @@
   ociBundlePath,
   containerPort ? 8080,
   debugMode ? false,
+  nbdClientPkg ? null,
+  storageEnabled ? false,
+  customKernel ? null,
 }:
 
 let
@@ -29,7 +32,7 @@ let
 
   enclaviaConfig = if hasCustomConfig
     then bundleConfig
-    else pkgs.writeText "enclavia-config.json" (builtins.toJSON {
+    else pkgs.writeText "enclavia-config.json" (builtins.toJSON ({
       listen_vsock_port = 5000;
       oci_bundle_path = "/var/lib/oci/bundle";
       customer_app = {
@@ -37,7 +40,14 @@ let
         health_check = "/health";
         startup_timeout_secs = 30;
       };
-    });
+    } // (if storageEnabled then {
+      storage = {
+        enabled = true;
+        vsock_port = 5001;
+        mount_point = "/data";
+        device = "/dev/nbd0";
+      };
+    } else {})));
 
   initScript = pkgs.writeShellScript "enclave-init" (builtins.readFile ./init.sh);
 
@@ -53,6 +63,18 @@ let
     ln -s busybox $out/bin/ip
     ln -s busybox $out/bin/mount
     ln -s busybox $out/bin/mkdir
+    ln -s busybox $out/bin/sleep
+    ln -s busybox $out/bin/insmod
+    ln -s busybox $out/bin/sh
+
+    ${if storageEnabled && nbdClientPkg != null then ''
+    # NBD client for enclave storage
+    cp ${nbdClientPkg}/bin/enclavia-nbd-client $out/bin/
+
+    # Filesystem tools for first-time format
+    cp ${pkgs.pkgsStatic.e2fsprogs}/bin/mkfs.ext4 $out/bin/
+    cp ${pkgs.pkgsStatic.util-linux}/bin/blkid $out/bin/
+    '' else ""}
 
     # Init script — must be inside the rootfs since the init binary
     # does chroot("/rootfs") before executing the entrypoint.
@@ -73,9 +95,14 @@ let
 in
   nitroLib.buildEif {
     name = "enclavia-enclave";
-    kernel = blobs.kernel;
-    kernelConfig = blobs.kernelConfig;
-    nsmKo = blobs.nsmKo;
+    kernel = if customKernel != null
+      then "${customKernel}/bzImage"
+      else blobs.kernel;
+    kernelConfig = if customKernel != null
+      then customKernel.configfile
+      else blobs.kernelConfig;
+    # Modern kernels (6.x+) have the NSM guest driver built-in
+    nsmKo = if customKernel != null then null else blobs.nsmKo;
     copyToRoot = rootfs;
     entrypoint = "/bin/enclave-init";
     init = initBinary;
