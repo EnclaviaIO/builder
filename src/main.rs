@@ -54,6 +54,20 @@ enum Cli {
         /// Build for debug mode (QEMU with patched init using CID 2)
         #[arg(long)]
         debug: bool,
+
+        /// Build with persistent encrypted storage support (LUKS over NBD).
+        /// When set, --kms-key-id is required and the EIF target switches to
+        /// `enclave-storage[-debug]`, which includes a custom kernel with
+        /// dm-crypt + NBD and the enclavia-crypto binary.
+        #[arg(long)]
+        storage: bool,
+
+        /// KMS key ID baked into the enclave's enclavia-config.json (only used
+        /// when --storage is set). For mock-kms in debug mode this can be any
+        /// stable string per enclave; in production this is the KMS ARN whose
+        /// policy is bound to the EIF's PCRs.
+        #[arg(long)]
+        kms_key_id: Option<String>,
     },
 }
 
@@ -241,6 +255,7 @@ async fn build_eif(
     enclavia_server_dir: &Path,
     result_link: &Path,
     debug: bool,
+    storage: bool,
 ) -> Result<()> {
     let bundle_arg = format!("path:{}", bundle_dir.display());
     let server_arg = format!("path:{}", enclavia_server_dir.display());
@@ -253,7 +268,16 @@ async fn build_eif(
         .and_then(|p| p.parent()) // target/release -> target -> builder root
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    let target = if debug { "enclave-debug" } else { "enclave" };
+    // `enclave-storage[-debug]` pulls in the storage-capable kernel, the
+    // enclavia-crypto binary, and cryptsetup. The kms_key_id baked into the
+    // EIF comes from enclavia-config.json (which we wrote into the bundle),
+    // so the `kmsKeyId` parameter on the nix target is unused here.
+    let target = match (debug, storage) {
+        (true, true) => "enclave-storage-debug",
+        (false, true) => "enclave-storage",
+        (true, false) => "enclave-debug",
+        (false, false) => "enclave",
+    };
     let flake_ref = format!("{}#{}", builder_dir.display(), target);
 
     run_cmd(
@@ -300,8 +324,12 @@ fn copy_artifacts(result_dir: &Path, output_dir: &Path) -> Result<()> {
 }
 
 /// Write the enclavia config into the bundle so enclave.nix picks it up.
-fn write_enclavia_config(bundle_dir: &Path, container_port: u16) -> Result<()> {
-    let config = serde_json::json!({
+fn write_enclavia_config(
+    bundle_dir: &Path,
+    container_port: u16,
+    storage_kms_key_id: Option<&str>,
+) -> Result<()> {
+    let mut config = serde_json::json!({
         "listen_vsock_port": 5000,
         "oci_bundle_path": "/var/lib/oci/bundle",
         "customer_app": {
@@ -310,9 +338,26 @@ fn write_enclavia_config(bundle_dir: &Path, container_port: u16) -> Result<()> {
             "startup_timeout_secs": 30
         }
     });
+
+    if let Some(key_id) = storage_kms_key_id {
+        config["storage"] = serde_json::json!({
+            "enabled": true,
+            "vsock_port": 5001,
+            "meta_vsock_port": 5002,
+            "kms_vsock_port": 5003,
+            "mount_point": "/data",
+            "device": "/dev/nbd0",
+            "kms_key_id": key_id,
+        });
+    }
+
     let path = bundle_dir.join("enclavia-config.json");
     std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap())?;
-    info!(container_port, "wrote enclavia config");
+    info!(
+        container_port,
+        storage = storage_kms_key_id.is_some(),
+        "wrote enclavia config"
+    );
     Ok(())
 }
 
@@ -323,6 +368,8 @@ async fn build(
     output_dir: &Path,
     container_port: u16,
     debug: bool,
+    storage: bool,
+    kms_key_id: Option<&str>,
 ) -> Result<BuildResult> {
     let tmp = tempfile::tempdir()?;
     let tmp_path = tmp.path();
@@ -351,11 +398,12 @@ async fn build(
     patch_bundle_config(&bundle_dir)?;
 
     // 4. Write enclavia config into bundle
-    write_enclavia_config(&bundle_dir, container_port)?;
+    let storage_kms_key_id = if storage { kms_key_id } else { None };
+    write_enclavia_config(&bundle_dir, container_port, storage_kms_key_id)?;
 
     // 5. Build the EIF
-    info!("building enclave image");
-    build_eif(&bundle_dir, &enclavia_server_abs, &result_link, debug).await?;
+    info!(storage, "building enclave image");
+    build_eif(&bundle_dir, &enclavia_server_abs, &result_link, debug, storage).await?;
 
     // 6. Read PCR values
     let pcrs = read_pcrs(&result_link)?;
@@ -391,13 +439,31 @@ async fn main() {
             output_dir,
             container_port,
             debug,
+            storage,
+            kms_key_id,
         } => {
             let creds = match (&registry_user, &registry_password) {
                 (Some(u), Some(p)) => Some((u.as_str(), p.as_str())),
                 _ => None,
             };
 
-            match build(&image, creds, &enclavia_server_dir, &output_dir, container_port, debug).await {
+            if storage && kms_key_id.is_none() {
+                error!("--storage requires --kms-key-id");
+                std::process::exit(2);
+            }
+
+            match build(
+                &image,
+                creds,
+                &enclavia_server_dir,
+                &output_dir,
+                container_port,
+                debug,
+                storage,
+                kms_key_id.as_deref(),
+            )
+            .await
+            {
                 Ok(result) => {
                     let json = serde_json::to_string_pretty(&result).unwrap();
                     println!("{json}");
