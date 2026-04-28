@@ -79,10 +79,12 @@
         # Custom kernel with NBD block device support for storage-enabled enclaves.
         # Based on the minimal AWS nitro kernel config (~1000 options) with
         # CONFIG_BLK_DEV_NBD=y and CONFIG_NSM=y added, adapted to a modern
-        # kernel source via `make oldconfig`.
+        # kernel source via `make oldconfig`. Pinned to 6.12 because OpenZFS
+        # in nixpkgs lags behind mainline by several months.
+        kernelPackages = pkgs.linuxPackages_6_12;
         storageKernel = pkgs.linuxManualConfig {
-          version = pkgs.linuxPackages_latest.kernel.version;
-          src = pkgs.linuxPackages_latest.kernel.src;
+          version = kernelPackages.kernel.version;
+          src = kernelPackages.kernel.src;
           configfile = ./nix/enclave-kernel.config;
           allowImportFromDerivation = true;
           kernelPatches = [{
@@ -90,6 +92,9 @@
             patch = ./nix/nbd-vsock.patch;
           }];
         };
+
+        # ZFS kernel module (spl.ko + zfs.ko) built against our custom kernel.
+        zfsKernelModule = (pkgs.linuxPackagesFor storageKernel).zfs_2_4;
 
         enclave = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg;
@@ -103,7 +108,7 @@
         };
 
         enclave-storage = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg zfsKernelModule;
           ociBundlePath = oci-bundle;
           storageEnabled = true;
           kmsKeyId = testKmsKeyId;
@@ -111,7 +116,7 @@
         };
 
         enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg zfsKernelModule;
           ociBundlePath = oci-bundle;
           debugMode = true;
           storageEnabled = true;
@@ -203,7 +208,7 @@
         test-storage-bundle = pkgs.callPackage ./nix/test-storage-bundle.nix { inherit pkgs; };
 
         test-enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg zfsKernelModule;
           ociBundlePath = test-storage-bundle;
           debugMode = true;
           storageEnabled = true;
@@ -222,7 +227,16 @@
           CPUS="''${2:-2}"
 
           GUEST_CID=4
-          SOCK_DIR="$(${pkgs.coreutils}/bin/mktemp -d /tmp/enclave-storage-test.XXXXXX)"
+          # If STORAGE_TEST_DIR is set, reuse that directory across runs (persistence test).
+          # Otherwise mktemp a fresh dir and clean it up at exit.
+          if [ -n "''${STORAGE_TEST_DIR:-}" ]; then
+              SOCK_DIR="''${STORAGE_TEST_DIR}"
+              ${pkgs.coreutils}/bin/mkdir -p "''${SOCK_DIR}"
+              PERSIST=1
+          else
+              SOCK_DIR="$(${pkgs.coreutils}/bin/mktemp -d /tmp/enclave-storage-test.XXXXXX)"
+              PERSIST=0
+          fi
           VHOST_SOCKET="''${SOCK_DIR}/vhost.sock"
           PROXY_SOCKET="''${SOCK_DIR}/proxy.sock"
           BACKING_FILE="''${SOCK_DIR}/disk.img"
@@ -237,7 +251,6 @@
               echo "storage-test-vm: cleaning up..."
               kill "''${HEARTBEAT_PID:-}" "''${VHOST_PID:-}" "''${STORAGE_PID:-}" "''${MOCK_KMS_PID:-}" 2>/dev/null || true
               wait "''${HEARTBEAT_PID:-}" "''${VHOST_PID:-}" "''${STORAGE_PID:-}" "''${MOCK_KMS_PID:-}" 2>/dev/null || true
-              # Check if the backing file has data (non-zero blocks = I/O happened)
               if [ -f "''${BACKING_FILE}" ]; then
                   BLOCKS=$(${pkgs.coreutils}/bin/stat --format=%b "''${BACKING_FILE}")
                   SIZE=$(${pkgs.coreutils}/bin/stat --format=%s "''${BACKING_FILE}")
@@ -248,7 +261,13 @@
                       echo "storage-test-vm: WARNING: backing file has no data blocks"
                   fi
               fi
-              ${pkgs.coreutils}/bin/rm -rf "''${SOCK_DIR}"
+              if [ "''${PERSIST}" = "1" ]; then
+                  echo "storage-test-vm: STORAGE_TEST_DIR set — preserving ''${SOCK_DIR} for re-run"
+                  # Sockets won't survive a re-run anyway, drop them so the new run can recreate.
+                  ${pkgs.coreutils}/bin/rm -f "''${VHOST_SOCKET}" "''${PROXY_SOCKET}"_* 2>/dev/null || true
+              else
+                  ${pkgs.coreutils}/bin/rm -rf "''${SOCK_DIR}"
+              fi
           }
           trap cleanup EXIT
 
@@ -286,9 +305,14 @@
 
           # 3. Pre-write the bootstrap key blob to the first 4KB of the backing file.
           # The backend would do this in production; in dev we synthesize it here.
-          echo "storage-test-vm: writing bootstrap key blob..."
-          ${pkgs.coreutils}/bin/printf '%s' '{"version":1,"kms_key_id":"'"''${KMS_KEY_ID}"'"}' > "''${BACKING_FILE}"
-          ${pkgs.coreutils}/bin/truncate -s 4096 "''${BACKING_FILE}"
+          # Skip if the file already exists and has data (persistence-test re-run).
+          if [ -s "''${BACKING_FILE}" ]; then
+              echo "storage-test-vm: re-using existing backing file (size=$(${pkgs.coreutils}/bin/stat --format=%s "''${BACKING_FILE}"))"
+          else
+              echo "storage-test-vm: writing bootstrap key blob..."
+              ${pkgs.coreutils}/bin/printf '%s' '{"version":1,"kms_key_id":"'"''${KMS_KEY_ID}"'"}' > "''${BACKING_FILE}"
+              ${pkgs.coreutils}/bin/truncate -s 4096 "''${BACKING_FILE}"
+          fi
 
           # 4. Start storage daemon (NBD on 5001, key-blob on 5002).
           echo "storage-test-vm: starting storage daemon (backing=''${BACKING_FILE}, 64M)..."
@@ -335,7 +359,7 @@
           # 6. Launch QEMU
           echo ""
           echo "  Watch the console output for 'storage-test:' messages."
-          echo "  The enclave will mount LUKS-encrypted /data via NBD and write test files."
+          echo "  The enclave will mount an encrypted ZFS pool at /data via NBD and write test files."
           echo "  Press Ctrl-C to stop."
           echo ""
 

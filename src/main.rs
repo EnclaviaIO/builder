@@ -55,10 +55,10 @@ enum Cli {
         #[arg(long)]
         debug: bool,
 
-        /// Build with persistent encrypted storage support (LUKS over NBD).
+        /// Build with persistent encrypted storage support (ZFS over NBD).
         /// When set, --kms-key-id is required and the EIF target switches to
         /// `enclave-storage[-debug]`, which includes a custom kernel with
-        /// dm-crypt + NBD and the enclavia-crypto binary.
+        /// NBD + ZFS modules and the enclavia-crypto binary.
         #[arg(long)]
         storage: bool,
 
@@ -268,10 +268,11 @@ async fn build_eif(
         .and_then(|p| p.parent()) // target/release -> target -> builder root
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    // `enclave-storage[-debug]` pulls in the storage-capable kernel, the
-    // enclavia-crypto binary, and cryptsetup. The kms_key_id baked into the
-    // EIF comes from enclavia-config.json (which we wrote into the bundle),
-    // so the `kmsKeyId` parameter on the nix target is unused here.
+    // `enclave-storage[-debug]` pulls in the storage-capable kernel (with NBD
+    // + ZFS modules), the enclavia-crypto binary, and ZFS userspace. The
+    // kms_key_id baked into the EIF comes from enclavia-config.json (which we
+    // wrote into the bundle), so the `kmsKeyId` parameter on the nix target
+    // is unused here.
     let target = match (debug, storage) {
         (true, true) => "enclave-storage-debug",
         (false, true) => "enclave-storage",

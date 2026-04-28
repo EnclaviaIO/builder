@@ -75,28 +75,41 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
 
     read -r size < /sys/block/nbd0/size 2>/dev/null
     if [ -n "$size" ] && [ "$size" -gt 0 ] 2>/dev/null; then
-        # Get/create LUKS passphrase via KMS (writes /tmp/luks.key).
+        # Load ZFS modules. Cap ARC at 64MB and floor at 16MB — the default
+        # of ~50% RAM would dwarf a small enclave.
+        /bin/insmod /lib/modules/spl.ko
+        /bin/insmod /lib/modules/zfs.ko zfs_arc_max=67108864 zfs_arc_min=16777216
+
+        # Get/create the raw 32-byte ZFS encryption key via KMS (writes /tmp/zfs.key).
         /bin/enclavia-crypto init
 
-        # Format on first use, then unlock.
-        # --pbkdf-memory caps Argon2id at 64MB (default ~1GB OOMs in small enclaves).
-        if ! /bin/cryptsetup isLuks /dev/nbd0 2>/dev/null; then
-            /bin/cryptsetup luksFormat \
-                --batch-mode \
-                --pbkdf-memory 65536 \
-                --key-file /tmp/luks.key \
-                /dev/nbd0
+        # Try import first — on subsequent boots the pool already exists.
+        # -N skips auto-mount; -d /dev because zpool's default scan path is
+        # /dev/disk/by-id which we don't populate.
+        if /bin/zpool import -N -d /dev tank 2>/dev/null; then
+            # Import path: -N skipped auto-mount, so load key + mount explicitly.
+            /bin/zfs load-key -L file:///tmp/zfs.key tank
+            /bin/zfs mount tank
+        else
+            # First boot: create the pool with native encryption.
+            # AES-256-GCM gives confidentiality + per-block authentication;
+            # the uberblock's SHA-256 commits to the entire Merkle tree.
+            # zpool create auto-mounts, so no separate `zfs mount` needed.
+            /bin/zpool create -f \
+                -O encryption=aes-256-gcm \
+                -O keyformat=raw \
+                -O keylocation=file:///tmp/zfs.key \
+                -O mountpoint=/data \
+                -O atime=off \
+                -O compression=off \
+                tank /dev/nbd0
         fi
-        /bin/cryptsetup luksOpen --key-file /tmp/luks.key /dev/nbd0 encdata
 
         # Remove plaintext key — must not be accessible to customer code.
         # The upgrade flow re-decrypts via KMS rather than reading this file.
-        /bin/rm -f /tmp/luks.key
+        /bin/rm -f /tmp/zfs.key
 
-        /bin/blkid /dev/mapper/encdata >/dev/null 2>&1 || /bin/mkfs.ext4 -q /dev/mapper/encdata
-        /bin/mkdir -p /data
-        /bin/mount /dev/mapper/encdata /data
-        echo "storage: encrypted volume mounted at /data"
+        echo "storage: encrypted ZFS pool mounted at /data"
 
         # Bind-mount into container rootfs so the app can access it
         /bin/mkdir -p "$ROOTFS/data"

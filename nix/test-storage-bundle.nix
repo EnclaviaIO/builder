@@ -17,26 +17,45 @@ let
           # Wait for /data to be mounted by init.sh
           i=0
           while [ $i -lt 100 ]; do
-            if mountpoint -q /data 2>/dev/null || [ -d /data/lost+found ]; then
+            if mountpoint -q /data 2>/dev/null; then
               break
             fi
             sleep 0.1
             i=$((i + 1))
           done
 
-          if [ -d /data/lost+found ]; then
+          if mountpoint -q /data 2>/dev/null; then
             echo 'storage-test: /data is mounted!'
 
-            # Write test data
+            # Cross-boot persistence probe: if /data/persist.bin already exists
+            # from a previous boot, verify its md5 matches the recorded one.
+            PERSIST_STATUS="first-boot"
+            if [ -f /data/persist.bin ] && [ -f /data/persist.md5 ]; then
+              EXPECTED=$(cat /data/persist.md5)
+              ACTUAL=$(md5sum /data/persist.bin | cut -d' ' -f1)
+              if [ "$EXPECTED" = "$ACTUAL" ]; then
+                PERSIST_STATUS="persist-ok md5=$ACTUAL"
+                echo "storage-test: PERSIST_OK existing data verified (md5=$ACTUAL)"
+              else
+                PERSIST_STATUS="persist-corrupt expected=$EXPECTED actual=$ACTUAL"
+                echo "storage-test: ERROR persist.bin corrupt expected=$EXPECTED actual=$ACTUAL"
+              fi
+            else
+              echo 'storage-test: first boot, creating persist.bin'
+              dd if=/dev/urandom of=/data/persist.bin bs=1024 count=64 2>/dev/null
+              md5sum /data/persist.bin | cut -d' ' -f1 > /data/persist.md5
+              sync
+              PERSIST_STATUS="created md5=$(cat /data/persist.md5)"
+            fi
+
+            # Per-boot write test (always fresh)
             echo 'STORAGE_TEST_OK' > /data/test.txt
             dd if=/dev/urandom of=/data/random.bin bs=1024 count=64 2>/dev/null
             CHECKSUM=$(md5sum /data/random.bin | cut -d' ' -f1)
-            echo "$CHECKSUM" > /data/checksum.txt
             sync
 
             echo "storage-test: wrote test.txt and random.bin (md5=$CHECKSUM)"
 
-            # Re-read and verify
             VERIFY=$(md5sum /data/random.bin | cut -d' ' -f1)
             if [ "$CHECKSUM" = "$VERIFY" ]; then
               echo 'storage-test: read-back checksum OK'
@@ -44,7 +63,7 @@ let
               echo 'storage-test: ERROR checksum mismatch!'
             fi
 
-            BODY="PASS: storage=$CHECKSUM"
+            BODY="PASS: storage=$CHECKSUM persist=$PERSIST_STATUS"
           else
             echo 'storage-test: WARNING /data not mounted'
             BODY="FAIL: /data not mounted"

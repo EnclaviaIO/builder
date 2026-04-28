@@ -10,6 +10,7 @@
   storageEnabled ? false,
   kmsKeyId ? null,
   customKernel ? null,
+  zfsKernelModule ? null,
 }:
 
 let
@@ -79,17 +80,22 @@ let
     # NBD client for enclave storage
     cp ${nbdClientPkg}/bin/enclavia-nbd-client $out/bin/
 
-    # KMS / LUKS key management
+    # KMS key management — fetches/generates the ZFS encryption key.
     ${if enclaviaCryptoPkg != null then ''
       cp ${enclaviaCryptoPkg}/bin/enclavia-crypto $out/bin/
     '' else throw "enclaviaCryptoPkg is required when storageEnabled = true"}
 
-    # cryptsetup for LUKS — must be statically linked.
-    cp ${pkgs.pkgsStatic.cryptsetup}/bin/cryptsetup $out/bin/
-
-    # Filesystem tools for first-time format
-    cp ${pkgs.pkgsStatic.e2fsprogs}/bin/mkfs.ext4 $out/bin/
-    cp ${pkgs.pkgsStatic.util-linux}/bin/blkid $out/bin/
+    # ZFS userspace + kernel modules. ZFS gives us confidentiality (AES-GCM)
+    # and integrity (per-block Merkle tree rooted in the uberblock). Rollback
+    # and cross-host durability are still TODOs — see ../enclavia-crates/docs/storage.md.
+    ${if zfsKernelModule != null then ''
+      cp ${pkgs.zfs}/sbin/zpool $out/bin/
+      cp ${pkgs.zfs}/sbin/zfs $out/bin/
+      cp ${pkgs.zfs}/sbin/mount.zfs $out/bin/
+      mkdir -p $out/lib/modules
+      cp ${zfsKernelModule}/lib/modules/*/extra/spl.ko $out/lib/modules/
+      cp ${zfsKernelModule}/lib/modules/*/extra/zfs.ko $out/lib/modules/
+    '' else throw "zfsKernelModule is required when storageEnabled = true"}
     '' else ""}
 
     # Init script — must be inside the rootfs since the init binary
