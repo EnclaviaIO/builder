@@ -10,7 +10,9 @@
   storageEnabled ? false,
   kmsKeyId ? null,
   customKernel ? null,
-  zfsKernelModule ? null,
+  # Diagnostic: skip LUKS and mount raw btrfs on the NBD device directly.
+  # Used to isolate proxy throughput from cryptsetup overhead during testing.
+  skipLuks ? false,
 }:
 
 let
@@ -53,8 +55,10 @@ let
         device = "/dev/nbd0";
         kms_key_id = if kmsKeyId != null
           then kmsKeyId
-          else throw "kmsKeyId is required when storageEnabled = true";
-      };
+          else if skipLuks
+            then "diagnostic-skip-luks"
+            else throw "kmsKeyId is required when storageEnabled = true";
+      } // (if skipLuks then { skip_luks = true; } else {});
     } else {})));
 
   initScript = pkgs.writeShellScript "enclave-init" (builtins.readFile ./init.sh);
@@ -77,25 +81,20 @@ let
     ln -s busybox $out/bin/rm
 
     ${if storageEnabled && nbdClientPkg != null then ''
-    # NBD client for enclave storage
+    # NBD client for enclave storage. The client also acts as a userspace
+    # filter in the data path so it can observe per-superblock writes for
+    # the synchronizer (logged-only for now).
     cp ${nbdClientPkg}/bin/enclavia-nbd-client $out/bin/
 
-    # KMS key management — fetches/generates the ZFS encryption key.
+    # KMS key management — fetches/generates the LUKS passphrase.
     ${if enclaviaCryptoPkg != null then ''
       cp ${enclaviaCryptoPkg}/bin/enclavia-crypto $out/bin/
     '' else throw "enclaviaCryptoPkg is required when storageEnabled = true"}
 
-    # ZFS userspace + kernel modules. ZFS gives us confidentiality (AES-GCM)
-    # and integrity (per-block Merkle tree rooted in the uberblock). Rollback
-    # and cross-host durability are still TODOs — see ../enclavia-crates/docs/storage.md.
-    ${if zfsKernelModule != null then ''
-      cp ${pkgs.zfs}/sbin/zpool $out/bin/
-      cp ${pkgs.zfs}/sbin/zfs $out/bin/
-      cp ${pkgs.zfs}/sbin/mount.zfs $out/bin/
-      mkdir -p $out/lib/modules
-      cp ${zfsKernelModule}/lib/modules/*/extra/spl.ko $out/lib/modules/
-      cp ${zfsKernelModule}/lib/modules/*/extra/zfs.ko $out/lib/modules/
-    '' else throw "zfsKernelModule is required when storageEnabled = true"}
+    # cryptsetup (dm-crypt / LUKS2) and btrfs userspace.
+    cp ${pkgs.pkgsStatic.cryptsetup}/bin/cryptsetup $out/bin/
+    cp ${pkgs.pkgsStatic.btrfs-progs}/bin/mkfs.btrfs $out/bin/
+    cp ${pkgs.pkgsStatic.util-linux}/bin/blkid $out/bin/
     '' else ""}
 
     # Init script — must be inside the rootfs since the init binary

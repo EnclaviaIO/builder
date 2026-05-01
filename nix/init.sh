@@ -39,15 +39,20 @@ ROOTFS="/var/lib/oci/bundle/rootfs"
 /bin/mount -t tmpfs tmpfs "$ROOTFS/tmp" 2>/dev/null || true
 
 # --- Optional storage setup ---
-# Parse storage.enabled from config using shell builtins.
+# Parse storage.enabled / storage.skip_luks from config using shell builtins.
+# `builtins.toJSON` in Nix produces a single-line JSON, so case-in-while only
+# fires the first matching arm. Use independent `if` checks instead.
 STORAGE_ENABLED=false
+SKIP_LUKS=false
 if [ -f "$CONFIG" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in
-            *'"enabled"'*'true'*)
-                # Only match if we're in the storage section (heuristic: after "storage")
-                STORAGE_ENABLED=true
-                ;;
+            *'"enabled":true'*) STORAGE_ENABLED=true ;;
+            *'"enabled": true'*) STORAGE_ENABLED=true ;;
+        esac
+        case "$line" in
+            *'"skip_luks":true'*) SKIP_LUKS=true ;;
+            *'"skip_luks": true'*) SKIP_LUKS=true ;;
         esac
     done < "$CONFIG"
 fi
@@ -59,8 +64,14 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
     # Mount sysfs so we can check /sys/block/nbd0/size
     /bin/mount -t sysfs sysfs /sys 2>/dev/null || true
 
-    # Start NBD client — connects to host via vsock CID 2:5001, sets up /dev/nbd0
-    /bin/enclavia-nbd-client &
+    # Start NBD client — connects to host via vsock CID 2:5001, sets up /dev/nbd0.
+    # In skip-LUKS diagnostic mode, the proxy sees raw btrfs writes (no dm-crypt
+    # offset translation), so superblock offsets line up at LUKS_DATA_OFFSET=0.
+    if [ "$SKIP_LUKS" = "true" ]; then
+        LUKS_DATA_OFFSET=0 /bin/enclavia-nbd-client &
+    else
+        /bin/enclavia-nbd-client &
+    fi
 
     # Wait for nbd-client to configure the device (non-zero size).
     # With NBD built into the kernel, /dev/nbd0 exists from boot but has
@@ -74,48 +85,45 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
     done
 
     read -r size < /sys/block/nbd0/size 2>/dev/null
-    if [ -n "$size" ] && [ "$size" -gt 0 ] 2>/dev/null; then
-        # Load ZFS modules. Cap ARC at 64MB and floor at 16MB — the default
-        # of ~50% RAM would dwarf a small enclave.
-        /bin/insmod /lib/modules/spl.ko
-        /bin/insmod /lib/modules/zfs.ko zfs_arc_max=67108864 zfs_arc_min=16777216
-
-        # Get/create the raw 32-byte ZFS encryption key via KMS (writes /tmp/zfs.key).
+    if [ -z "$size" ] || ! [ "$size" -gt 0 ] 2>/dev/null; then
+        echo "WARNING: /dev/nbd0 not configured (size=0), storage unavailable" >&2
+    elif [ "$SKIP_LUKS" = "true" ]; then
+        # Diagnostic path: skip LUKS entirely. Format btrfs directly on the
+        # raw NBD device and mount it. Used to isolate the proxy's behaviour
+        # from cryptsetup's KDF + 16 MiB header wipe overhead on TCG.
+        /bin/blkid /dev/nbd0 >/dev/null 2>&1 || /bin/mkfs.btrfs -f /dev/nbd0
+        /bin/mkdir -p /data
+        /bin/mount -o noatime,noexec,nosuid,nodev /dev/nbd0 /data
+        echo "storage: btrfs mounted at /data (LUKS bypassed, diagnostic mode)"
+        /bin/mkdir -p "$ROOTFS/data"
+        /bin/mount --bind /data "$ROOTFS/data" 2>/dev/null || true
+    else
+        # Get/create LUKS passphrase via KMS (writes /tmp/luks.key).
         /bin/enclavia-crypto init
 
-        # Try import first — on subsequent boots the pool already exists.
-        # -N skips auto-mount; -d /dev because zpool's default scan path is
-        # /dev/disk/by-id which we don't populate.
-        if /bin/zpool import -N -d /dev tank 2>/dev/null; then
-            # Import path: -N skipped auto-mount, so load key + mount explicitly.
-            /bin/zfs load-key -L file:///tmp/zfs.key tank
-            /bin/zfs mount tank
-        else
-            # First boot: create the pool with native encryption.
-            # AES-256-GCM gives confidentiality + per-block authentication;
-            # the uberblock's SHA-256 commits to the entire Merkle tree.
-            # zpool create auto-mounts, so no separate `zfs mount` needed.
-            /bin/zpool create -f \
-                -O encryption=aes-256-gcm \
-                -O keyformat=raw \
-                -O keylocation=file:///tmp/zfs.key \
-                -O mountpoint=/data \
-                -O atime=off \
-                -O compression=off \
-                tank /dev/nbd0
+        if ! /bin/cryptsetup isLuks /dev/nbd0 2>/dev/null; then
+            /bin/cryptsetup luksFormat \
+                --batch-mode \
+                --key-file /tmp/luks.key \
+                /dev/nbd0
         fi
+        /bin/cryptsetup luksOpen --key-file /tmp/luks.key /dev/nbd0 encdata
 
         # Remove plaintext key — must not be accessible to customer code.
         # The upgrade flow re-decrypts via KMS rather than reading this file.
-        /bin/rm -f /tmp/zfs.key
+        /bin/rm -f /tmp/luks.key
 
-        echo "storage: encrypted ZFS pool mounted at /data"
+        # Format with btrfs on first boot. Btrfs gives us csum-tree-rooted
+        # tamper detection; the per-superblock-write hooks in nbd-client
+        # rely on btrfs's fixed superblock offsets {64KiB, 64MiB, 256GiB}.
+        /bin/blkid /dev/mapper/encdata >/dev/null 2>&1 || /bin/mkfs.btrfs -f /dev/mapper/encdata
+        /bin/mkdir -p /data
+        /bin/mount -o noatime,noexec,nosuid,nodev /dev/mapper/encdata /data
+        echo "storage: LUKS-encrypted btrfs mounted at /data"
 
         # Bind-mount into container rootfs so the app can access it
         /bin/mkdir -p "$ROOTFS/data"
         /bin/mount --bind /data "$ROOTFS/data" 2>/dev/null || true
-    else
-        echo "WARNING: /dev/nbd0 not configured (size=0), storage unavailable" >&2
     fi
 fi
 

@@ -79,12 +79,10 @@
         # Custom kernel with NBD block device support for storage-enabled enclaves.
         # Based on the minimal AWS nitro kernel config (~1000 options) with
         # CONFIG_BLK_DEV_NBD=y and CONFIG_NSM=y added, adapted to a modern
-        # kernel source via `make oldconfig`. Pinned to 6.12 because OpenZFS
-        # in nixpkgs lags behind mainline by several months.
-        kernelPackages = pkgs.linuxPackages_6_12;
+        # kernel source via `make oldconfig`.
         storageKernel = pkgs.linuxManualConfig {
-          version = kernelPackages.kernel.version;
-          src = kernelPackages.kernel.src;
+          version = pkgs.linuxPackages_latest.kernel.version;
+          src = pkgs.linuxPackages_latest.kernel.src;
           configfile = ./nix/enclave-kernel.config;
           allowImportFromDerivation = true;
           kernelPatches = [{
@@ -92,9 +90,6 @@
             patch = ./nix/nbd-vsock.patch;
           }];
         };
-
-        # ZFS kernel module (spl.ko + zfs.ko) built against our custom kernel.
-        zfsKernelModule = (pkgs.linuxPackagesFor storageKernel).zfs_2_4;
 
         enclave = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg;
@@ -108,7 +103,7 @@
         };
 
         enclave-storage = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg zfsKernelModule;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg;
           ociBundlePath = oci-bundle;
           storageEnabled = true;
           kmsKeyId = testKmsKeyId;
@@ -116,7 +111,7 @@
         };
 
         enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg zfsKernelModule;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg;
           ociBundlePath = oci-bundle;
           debugMode = true;
           storageEnabled = true;
@@ -208,11 +203,23 @@
         test-storage-bundle = pkgs.callPackage ./nix/test-storage-bundle.nix { inherit pkgs; };
 
         test-enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg zfsKernelModule;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg;
           ociBundlePath = test-storage-bundle;
           debugMode = true;
           storageEnabled = true;
           kmsKeyId = testKmsKeyId;
+          customKernel = storageKernel;
+        };
+
+        # Diagnostic variant: storage path skips LUKS so the proxy is exercised
+        # against raw btrfs writes. Used to isolate proxy throughput from
+        # cryptsetup overhead on TCG.
+        test-enclave-storage-debug-no-luks = pkgs.callPackage ./nix/enclave.nix {
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg;
+          ociBundlePath = test-storage-bundle;
+          debugMode = true;
+          storageEnabled = true;
+          skipLuks = true;
           customKernel = storageKernel;
         };
 
@@ -222,7 +229,15 @@
         test-storage-vm = pkgs.writeShellScriptBin "enclavia-test-storage-vm" ''
           set -euo pipefail
 
-          EIF_PATH="${test-enclave-storage-debug}/image.eif"
+          # NO_LUKS=1 swaps in a diagnostic EIF where init.sh runs mkfs.btrfs
+          # straight on /dev/nbd0, bypassing cryptsetup. Used to isolate the
+          # NBD proxy's behaviour from LUKS overhead on TCG.
+          if [ "''${NO_LUKS:-0}" = "1" ]; then
+              EIF_PATH="${test-enclave-storage-debug-no-luks}/image.eif"
+              echo "storage-test-vm: NO_LUKS=1 → using LUKS-bypass EIF"
+          else
+              EIF_PATH="${test-enclave-storage-debug}/image.eif"
+          fi
           MEMORY="''${1:-4G}"
           CPUS="''${2:-2}"
 
@@ -315,12 +330,14 @@
           fi
 
           # 4. Start storage daemon (NBD on 5001, key-blob on 5002).
-          echo "storage-test-vm: starting storage daemon (backing=''${BACKING_FILE}, 64M)..."
+          # 256M is the practical floor: btrfs requires ~114M, and LUKS eats a
+          # 16M header on top, so anything smaller fails mkfs.
+          echo "storage-test-vm: starting storage daemon (backing=''${BACKING_FILE}, 256M)..."
           BACKING_FILE="''${BACKING_FILE}" \
-          DISK_SIZE="64M" \
+          DISK_SIZE="256M" \
           LISTEN_PATH="''${PROXY_SOCKET}_''${STORAGE_VSOCK_PORT}" \
           META_LISTEN_PATH="''${PROXY_SOCKET}_''${META_VSOCK_PORT}" \
-          RUST_LOG=info \
+          RUST_LOG="''${RUST_LOG:-info}" \
               ${storageHostBin} &
           STORAGE_PID=$!
 
@@ -359,7 +376,7 @@
           # 6. Launch QEMU
           echo ""
           echo "  Watch the console output for 'storage-test:' messages."
-          echo "  The enclave will mount an encrypted ZFS pool at /data via NBD and write test files."
+          echo "  The enclave will mount a LUKS-encrypted btrfs at /data via NBD and write test files."
           echo "  Press Ctrl-C to stop."
           echo ""
 
@@ -441,7 +458,7 @@
       in
       {
         packages = {
-          inherit builder enclave enclave-debug enclave-storage enclave-storage-debug debug-vm test-bundle test-enclave test-enclave-debug test-debug-vm test-storage-bundle test-enclave-storage-debug test-storage-vm;
+          inherit builder enclave enclave-debug enclave-storage enclave-storage-debug debug-vm test-bundle test-enclave test-enclave-debug test-debug-vm test-storage-bundle test-enclave-storage-debug test-enclave-storage-debug-no-luks test-storage-vm;
           default = builder;
         };
 
