@@ -5,7 +5,7 @@
   inputs.flake-utils.url = "github:numtide/flake-utils";
   outputs = { self, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system: {
-      packages.nbd-client-enclave =
+      packages.nbd-client =
         throw "nbd-client input not configured — use --override-input nbd-client path:/path/to/enclavia-crates";
     });
 }

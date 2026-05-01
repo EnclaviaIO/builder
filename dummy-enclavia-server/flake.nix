@@ -5,7 +5,7 @@
   inputs.flake-utils.url = "github:numtide/flake-utils";
   outputs = { self, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system: {
-      packages.enclavia-server-enclave =
+      packages.enclavia-server =
         throw "enclavia-server input not configured — use --override-input enclavia-server path:/path/to/enclavia-server";
     });
 }
