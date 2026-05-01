@@ -63,6 +63,36 @@ let
               echo 'storage-test: ERROR checksum mismatch!'
             fi
 
+            # --- Throughput benchmark ---
+            # /data is the encrypted-storage path (LUKS+btrfs over NBD over vsock).
+            # /tmp is a tmpfs set up by init.sh — same TCG overhead, no proxy/LUKS.
+            BENCH_BYTES=$((16 * 1024 * 1024))
+            BENCH_COUNT=16
+            BENCH_BS=1M
+
+            echo '===== BENCH BEGIN ====='
+
+            echo 'bench: /data sequential write (16 MiB, bs=1M, fsync)'
+            dd if=/dev/zero of=/data/bench.bin bs=$BENCH_BS count=$BENCH_COUNT conv=fsync 2>&1 | grep -v records
+            sync
+            echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+            echo 'bench: /data sequential read'
+            dd if=/data/bench.bin of=/dev/null bs=$BENCH_BS 2>&1 | grep -v records
+            rm -f /data/bench.bin
+            sync
+
+            echo 'bench: /tmp (ramdisk) sequential write (16 MiB, bs=1M, fsync)'
+            dd if=/dev/zero of=/tmp/bench.bin bs=$BENCH_BS count=$BENCH_COUNT conv=fsync 2>&1 | grep -v records
+            sync
+            echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+            echo 'bench: /tmp sequential read'
+            dd if=/tmp/bench.bin of=/dev/null bs=$BENCH_BS 2>&1 | grep -v records
+            rm -f /tmp/bench.bin
+
+            echo '===== BENCH END ====='
+
             BODY="PASS: storage=$CHECKSUM persist=$PERSIST_STATUS"
           else
             echo 'storage-test: WARNING /data not mounted'
@@ -103,7 +133,7 @@ in pkgs.runCommand "test-storage-oci-bundle" {} ''
 
   # Use busybox for sh, nc, dd, md5sum, and basic utilities
   cp ${pkgs.pkgsStatic.busybox}/bin/busybox $out/rootfs/bin/busybox
-  for cmd in sh nc echo cat ls mkdir dd md5sum sleep sync mountpoint cut; do
+  for cmd in sh nc echo cat ls mkdir dd md5sum sleep sync mountpoint cut grep rm; do
     ln -s busybox $out/rootfs/bin/$cmd
   done
 
