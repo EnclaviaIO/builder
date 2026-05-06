@@ -39,6 +39,13 @@ enum Cli {
         #[arg(long)]
         registry_password: Option<String>,
 
+        /// Pre-minted bearer token for the source registry. Bypasses the
+        /// distribution auth realm round-trip — the caller (typically
+        /// enclavia-backend) signs it directly with the registry's JWKS
+        /// key. Mutually exclusive with --registry-user/--registry-password.
+        #[arg(long)]
+        registry_token: Option<String>,
+
         /// Path to the enclavia-server source directory
         #[arg(long, default_value = "../enclavia-server")]
         enclavia_server_dir: PathBuf,
@@ -122,7 +129,19 @@ async fn run_cmd(cmd: &str, args: &[&str]) -> Result<String> {
 }
 
 /// Pull a Docker image to a local OCI layout using skopeo.
-async fn pull_image(image: &str, dest: &Path, creds: Option<(&str, &str)>) -> Result<()> {
+///
+/// Authentication can be passed two ways. `creds` triggers skopeo's full
+/// Bearer-auth handshake (HTTP Basic to the realm → bearer → re-request).
+/// `registry_token` skips that round-trip and hands skopeo a pre-minted
+/// bearer directly via `--src-registry-token`. The backend uses the latter
+/// because it already has the registry signing key in process and can sign
+/// itself a token without bouncing through the auth realm.
+async fn pull_image(
+    image: &str,
+    dest: &Path,
+    creds: Option<(&str, &str)>,
+    registry_token: Option<&str>,
+) -> Result<()> {
     let src = format!("docker://{image}");
     let dst = format!("oci:{}:latest", dest.display());
 
@@ -137,6 +156,10 @@ async fn pull_image(image: &str, dest: &Path, creds: Option<(&str, &str)>) -> Re
     if let Some((user, pass)) = creds {
         creds_str = format!("{user}:{pass}");
         args.extend(["--src-creds", &creds_str]);
+    }
+
+    if let Some(tok) = registry_token {
+        args.extend(["--src-registry-token", tok]);
     }
 
     run_cmd("skopeo", &args).await?;
@@ -395,6 +418,7 @@ fn write_enclavia_config(
 async fn build(
     image: &str,
     creds: Option<(&str, &str)>,
+    registry_token: Option<&str>,
     enclavia_server_dir: &Path,
     output_dir: &Path,
     container_port: u16,
@@ -420,7 +444,7 @@ async fn build(
 
     // 1. Pull the Docker image
     info!(image, "pulling image");
-    pull_image(image, &oci_layout, creds).await?;
+    pull_image(image, &oci_layout, creds, registry_token).await?;
 
     // 2. Unpack into OCI bundle
     info!("unpacking OCI bundle");
@@ -467,6 +491,7 @@ async fn main() {
             image,
             registry_user,
             registry_password,
+            registry_token,
             enclavia_server_dir,
             output_dir,
             container_port,
@@ -495,6 +520,7 @@ async fn main() {
             match build(
                 &image,
                 creds,
+                registry_token.as_deref(),
                 &enclavia_server_dir,
                 &output_dir,
                 container_port,
