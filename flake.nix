@@ -67,9 +67,9 @@
         });
 
         # --- Enclave EIF ---
-        enclaviaServerPkg = enclavia-server.packages.${system}.enclavia-server-enclave;
-        nbdClientPkg = nbd-client.packages.${system}.nbd-client-enclave;
-        enclaviaCryptoPkg = nbd-client.packages.${system}.enclavia-crypto-enclave;
+        enclaviaServerPkg = enclavia-server.packages.${system}.enclavia-server;
+        nbdClientPkg = nbd-client.packages.${system}.nbd-client;
+        enclaviaCryptoPkg = nbd-client.packages.${system}.enclavia-crypto;
         mockKmsPkg = nbd-client.packages.${system}.mock-kms;
         nitroLib = nitro-util.lib.${system};
 
