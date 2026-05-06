@@ -16,12 +16,6 @@
       # Don't follow our nixpkgs — nitro-util's Go builds break with newer nixpkgs
     };
 
-    # Stub placeholder — override at build time:
-    #   --override-input enclavia-server path:../enclavia-server
-    enclavia-server = {
-      url = "path:./dummy-enclavia-server";
-    };
-
     # Placeholder — override at build time:
     #   --override-input oci-bundle path:/path/to/bundle
     oci-bundle = {
@@ -29,14 +23,16 @@
       flake = false;
     };
 
-    # NBD client for enclave storage — override at build time:
-    #   --override-input nbd-client path:../enclavia-crates
-    nbd-client = {
-      url = "path:./dummy-nbd-client";
+    # All in-enclave Rust crates (enclavia-server, enclavia-crypto,
+    # nbd-client, mock-kms, storage-host) live in enclavia-crates and
+    # come through this single input. Override at build time:
+    #   --override-input enclavia-crates path:../enclavia-crates
+    enclavia-crates = {
+      url = "path:./dummy-enclavia-crates";
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, nitro-util, enclavia-server, oci-bundle, nbd-client }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, nitro-util, oci-bundle, enclavia-crates }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
@@ -67,10 +63,10 @@
         });
 
         # --- Enclave EIF ---
-        enclaviaServerPkg = enclavia-server.packages.${system}.enclavia-server;
-        nbdClientPkg = nbd-client.packages.${system}.nbd-client;
-        enclaviaCryptoPkg = nbd-client.packages.${system}.enclavia-crypto;
-        mockKmsPkg = nbd-client.packages.${system}.mock-kms;
+        enclaviaServerPkg = enclavia-crates.packages.${system}.enclavia-server;
+        nbdClientPkg = enclavia-crates.packages.${system}.nbd-client;
+        enclaviaCryptoPkg = enclavia-crates.packages.${system}.enclavia-crypto;
+        mockKmsPkg = enclavia-crates.packages.${system}.mock-kms;
         nitroLib = nitro-util.lib.${system};
 
         # Test KMS key ID — only used by mock-kms in test-storage-vm.
@@ -223,7 +219,7 @@
           customKernel = storageKernel;
         };
 
-        storageHostBin = "${nbd-client.packages.${system}.storage-host-debug or (throw "storage-host not built — override nbd-client input")}/bin/enclavia-storage";
+        storageHostBin = "${enclavia-crates.packages.${system}.storage-host-debug or (throw "storage-host not built — override enclavia-crates input")}/bin/enclavia-storage";
         mockKmsBin = "${mockKmsPkg}/bin/enclavia-mock-kms";
 
         test-storage-vm = pkgs.writeShellScriptBin "enclavia-test-storage-vm" ''
