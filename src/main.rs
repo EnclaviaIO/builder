@@ -292,12 +292,18 @@ async fn build_eif(
     let out_arg = result_link.to_string_lossy();
 
     // Resolve the builder's own directory so `nix build` finds the correct flake
-    // regardless of the working directory.
-    let builder_dir = std::env::current_exe()?
-        .parent()
-        .and_then(|p| p.parent()) // target/release -> target -> builder root
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
+    // regardless of the working directory. In production the binary lives at
+    // `<pkg>/bin/builder` with no flake.nix anywhere up the chain, so callers
+    // must set `BUILDER_FLAKE` to a path that contains the builder's flake
+    // (typically the source flake input from a wrapping deployment).
+    let builder_dir = match std::env::var_os("BUILDER_FLAKE") {
+        Some(p) => PathBuf::from(p),
+        None => std::env::current_exe()?
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(".")),
+    };
     // `enclave-storage[-debug]` pulls in the storage-capable kernel (with NBD
     // + dm-crypt + btrfs), the enclavia-crypto binary, and cryptsetup/btrfs
     // userspace. The kms_key_id baked into the EIF comes from enclavia-config.json
