@@ -46,10 +46,6 @@ enum Cli {
         #[arg(long)]
         registry_token: Option<String>,
 
-        /// Path to the enclavia-server source directory
-        #[arg(long, default_value = "../enclavia-server")]
-        enclavia_server_dir: PathBuf,
-
         /// Directory to write output artifacts (image.eif, pcr.json)
         #[arg(long, default_value = "./out")]
         output_dir: PathBuf,
@@ -279,16 +275,20 @@ fn patch_bundle_config(bundle_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Build the enclave EIF using nix, overriding the oci-bundle and enclavia-server inputs.
+/// Build the enclave EIF using nix, overriding the oci-bundle input.
+///
+/// In production the deployment also overrides `enclavia-crates` with a
+/// pinned source path via the `ENCLAVIA_CRATES_FLAKE` env var; in dev the
+/// flake's default (`./dummy-enclavia-crates`) is replaced by passing
+/// `--override-input enclavia-crates path:/path/to/enclavia-crates` to the
+/// QEMU wrapper.
 async fn build_eif(
     bundle_dir: &Path,
-    enclavia_server_dir: &Path,
     result_link: &Path,
     debug: bool,
     storage: bool,
 ) -> Result<()> {
     let bundle_arg = format!("path:{}", bundle_dir.display());
-    let server_arg = format!("path:{}", enclavia_server_dir.display());
     let out_arg = result_link.to_string_lossy();
 
     // Resolve the builder's own directory so `nix build` finds the correct flake
@@ -317,22 +317,29 @@ async fn build_eif(
     };
     let flake_ref = format!("{}#{}", builder_dir.display(), target);
 
-    run_cmd(
-        "nix",
-        &[
-            "build",
-            &flake_ref,
-            "--override-input",
-            "oci-bundle",
-            &bundle_arg,
-            "--override-input",
-            "enclavia-server",
-            &server_arg,
-            "-o",
-            &out_arg,
-        ],
-    )
-    .await?;
+    let mut args: Vec<String> = vec![
+        "build".into(),
+        flake_ref,
+        "--override-input".into(),
+        "oci-bundle".into(),
+        bundle_arg,
+    ];
+
+    // ENCLAVIA_CRATES_FLAKE — production-side override so the in-enclave
+    // binaries (enclavia-server, enclavia-crypto, nbd-client, mock-kms)
+    // come from the deployment's pinned `inputs.enclavia-crates` rather
+    // than the dummy stub baked into the builder flake.
+    if let Some(p) = std::env::var_os("ENCLAVIA_CRATES_FLAKE") {
+        args.push("--override-input".into());
+        args.push("enclavia-crates".into());
+        args.push(format!("path:{}", PathBuf::from(p).display()));
+    }
+
+    args.push("-o".into());
+    args.push(out_arg.into_owned());
+
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_cmd("nix", &arg_refs).await?;
 
     info!(?result_link, "EIF built successfully");
     Ok(())
@@ -425,7 +432,6 @@ async fn build(
     image: &str,
     creds: Option<(&str, &str)>,
     registry_token: Option<&str>,
-    enclavia_server_dir: &Path,
     output_dir: &Path,
     container_port: u16,
     debug: bool,
@@ -439,14 +445,6 @@ async fn build(
     let oci_layout = tmp_path.join("image");
     let bundle_dir = tmp_path.join("bundle");
     let result_link = tmp_path.join("result");
-
-    // Resolve enclavia-server to an absolute path for nix --override-input
-    let enclavia_server_abs = std::fs::canonicalize(enclavia_server_dir).map_err(|e| {
-        Error::Io(std::io::Error::new(
-            e.kind(),
-            format!("enclavia-server dir '{}': {e}", enclavia_server_dir.display()),
-        ))
-    })?;
 
     // 1. Pull the Docker image
     info!(image, "pulling image");
@@ -465,7 +463,7 @@ async fn build(
 
     // 5. Build the EIF
     info!(storage, "building enclave image");
-    build_eif(&bundle_dir, &enclavia_server_abs, &result_link, debug, storage).await?;
+    build_eif(&bundle_dir, &result_link, debug, storage).await?;
 
     // 6. Read PCR values
     let pcrs = read_pcrs(&result_link)?;
@@ -498,7 +496,6 @@ async fn main() {
             registry_user,
             registry_password,
             registry_token,
-            enclavia_server_dir,
             output_dir,
             container_port,
             debug,
@@ -527,7 +524,6 @@ async fn main() {
                 &image,
                 creds,
                 registry_token.as_deref(),
-                &enclavia_server_dir,
                 &output_dir,
                 container_port,
                 debug,
