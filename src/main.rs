@@ -59,18 +59,12 @@ enum Cli {
         debug: bool,
 
         /// Build with persistent encrypted storage support (LUKS+btrfs over NBD).
-        /// When set, --kms-key-id is required and the EIF target switches to
-        /// `enclave-storage[-debug]`, which includes a custom kernel with
-        /// NBD + dm-crypt + btrfs and the enclavia-crypto binary.
+        /// Switches the EIF target to `enclave-storage[-debug]`, which includes
+        /// a custom kernel with NBD + dm-crypt + btrfs and the enclavia-crypto
+        /// binary. The KMS key id is not baked into the EIF — enclavia-crypto
+        /// reads it from the bootstrap blob in the storage backing file.
         #[arg(long)]
         storage: bool,
-
-        /// KMS key ID baked into the enclave's enclavia-config.json (only used
-        /// when --storage is set). For mock-kms in debug mode this can be any
-        /// stable string per enclave; in production this is the KMS ARN whose
-        /// policy is bound to the EIF's PCRs.
-        #[arg(long)]
-        kms_key_id: Option<String>,
 
         /// Base64-encoded Ed25519 public key (32 raw bytes) for the management
         /// control channel. When set, enclavia-server will accept signed
@@ -306,9 +300,8 @@ async fn build_eif(
     };
     // `enclave-storage[-debug]` pulls in the storage-capable kernel (with NBD
     // + dm-crypt + btrfs), the enclavia-crypto binary, and cryptsetup/btrfs
-    // userspace. The kms_key_id baked into the EIF comes from enclavia-config.json
-    // (which we wrote into the bundle), so the `kmsKeyId` parameter on the
-    // nix target is unused here.
+    // userspace. The KMS key id lives in the bootstrap blob in the storage
+    // backing file, not in the EIF.
     let target = match (debug, storage) {
         (true, true) => "enclave-storage-debug",
         (false, true) => "enclave-storage",
@@ -388,7 +381,7 @@ fn validate_control_pubkey(b64: &str) -> std::result::Result<(), String> {
 fn write_enclavia_config(
     bundle_dir: &Path,
     container_port: u16,
-    storage_kms_key_id: Option<&str>,
+    storage: bool,
     control_pubkey: Option<&str>,
 ) -> Result<()> {
     let mut config = serde_json::json!({
@@ -401,7 +394,7 @@ fn write_enclavia_config(
         }
     });
 
-    if let Some(key_id) = storage_kms_key_id {
+    if storage {
         config["storage"] = serde_json::json!({
             "enabled": true,
             "vsock_port": 5001,
@@ -409,7 +402,6 @@ fn write_enclavia_config(
             "kms_vsock_port": 5003,
             "mount_point": "/data",
             "device": "/dev/nbd0",
-            "kms_key_id": key_id,
         });
     }
 
@@ -421,7 +413,7 @@ fn write_enclavia_config(
     std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap())?;
     info!(
         container_port,
-        storage = storage_kms_key_id.is_some(),
+        storage,
         control_channel = control_pubkey.is_some(),
         "wrote enclavia config"
     );
@@ -436,7 +428,6 @@ async fn build(
     container_port: u16,
     debug: bool,
     storage: bool,
-    kms_key_id: Option<&str>,
     control_pubkey: Option<&str>,
 ) -> Result<BuildResult> {
     let tmp = tempfile::tempdir()?;
@@ -458,8 +449,7 @@ async fn build(
     patch_bundle_config(&bundle_dir)?;
 
     // 4. Write enclavia config into bundle
-    let storage_kms_key_id = if storage { kms_key_id } else { None };
-    write_enclavia_config(&bundle_dir, container_port, storage_kms_key_id, control_pubkey)?;
+    write_enclavia_config(&bundle_dir, container_port, storage, control_pubkey)?;
 
     // 5. Build the EIF
     info!(storage, "building enclave image");
@@ -500,18 +490,12 @@ async fn main() {
             container_port,
             debug,
             storage,
-            kms_key_id,
             control_pubkey,
         } => {
             let creds = match (&registry_user, &registry_password) {
                 (Some(u), Some(p)) => Some((u.as_str(), p.as_str())),
                 _ => None,
             };
-
-            if storage && kms_key_id.is_none() {
-                error!("--storage requires --kms-key-id");
-                std::process::exit(2);
-            }
 
             if let Some(ref pk) = control_pubkey {
                 if let Err(e) = validate_control_pubkey(pk) {
@@ -528,7 +512,6 @@ async fn main() {
                 container_port,
                 debug,
                 storage,
-                kms_key_id.as_deref(),
                 control_pubkey.as_deref(),
             )
             .await

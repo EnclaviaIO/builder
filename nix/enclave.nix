@@ -8,7 +8,6 @@
   nbdClientPkg ? null,
   enclaviaCryptoPkg ? null,
   storageEnabled ? false,
-  kmsKeyId ? null,
   customKernel ? null,
   # Diagnostic: skip LUKS and mount raw btrfs on the NBD device directly.
   # Used to isolate proxy throughput from cryptsetup overhead during testing.
@@ -53,11 +52,6 @@ let
         kms_vsock_port = 5003;
         mount_point = "/data";
         device = "/dev/nbd0";
-        kms_key_id = if kmsKeyId != null
-          then kmsKeyId
-          else if skipLuks
-            then "diagnostic-skip-luks"
-            else throw "kmsKeyId is required when storageEnabled = true";
       } // (if skipLuks then { skip_luks = true; } else {});
     } else {})));
 
