@@ -227,7 +227,10 @@ func launch(cmd string, args []string, env []string) (pd int, err error) {
 func reapUntil(pid int) syscall.Signal {
 	for {
 		status := new(syscall.WaitStatus)
-		wpid, err := syscall.Wait4(-1, status, syscall.WNOHANG, nil)
+		// Block on Wait4 (no WNOHANG) — we only need to wake when a child
+		// actually changes state. With WNOHANG this loop spun a guest vCPU
+		// at 100% as soon as enclave-init handed off to a long-lived child.
+		wpid, err := syscall.Wait4(-1, status, 0, nil)
 		switch err {
 		case nil:
 			// the child we were waiting for died, return and pass the exit status
