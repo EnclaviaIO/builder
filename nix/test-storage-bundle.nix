@@ -140,5 +140,5 @@ in pkgs.runCommand "test-storage-oci-bundle" {} ''
   cp ${config} $out/config.json
 
   # No enclavia-config.json override — enclave.nix auto-generates a config
-  # with the appropriate storage + kms_key_id when storageEnabled = true.
+  # with the appropriate storage block when storageEnabled = true.
 ''

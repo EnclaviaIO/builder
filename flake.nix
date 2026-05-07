@@ -69,7 +69,9 @@
         mockKmsPkg = enclavia-crates.packages.${system}.mock-kms;
         nitroLib = nitro-util.lib.${system};
 
-        # Test KMS key ID — only used by mock-kms in test-storage-vm.
+        # Test KMS key ID seeded into the bootstrap blob (first 4KB of the
+        # backing file) by test-storage-vm. enclavia-crypto reads it from there
+        # at boot to talk to mock-kms.
         testKmsKeyId = "test-key-001";
 
         # Custom kernel with NBD block device support for storage-enabled enclaves.
@@ -102,7 +104,6 @@
           inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg;
           ociBundlePath = oci-bundle;
           storageEnabled = true;
-          kmsKeyId = testKmsKeyId;
           customKernel = storageKernel;
         };
 
@@ -111,7 +112,6 @@
           ociBundlePath = oci-bundle;
           debugMode = true;
           storageEnabled = true;
-          kmsKeyId = testKmsKeyId;
           customKernel = storageKernel;
         };
 
@@ -203,7 +203,6 @@
           ociBundlePath = test-storage-bundle;
           debugMode = true;
           storageEnabled = true;
-          kmsKeyId = testKmsKeyId;
           customKernel = storageKernel;
         };
 
