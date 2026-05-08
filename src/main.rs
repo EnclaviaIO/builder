@@ -72,6 +72,15 @@ enum Cli {
         /// disabled. Required for the upgrade flow.
         #[arg(long)]
         control_pubkey: Option<String>,
+
+        /// Per-enclave identifier stamped into `enclavia-config.json` so two
+        /// enclaves built from the same Docker image (and same other inputs)
+        /// still produce different PCRs. The value is opaque to the builder
+        /// — typically the backend's enclave UUID. Optional so direct
+        /// builder users (CI, manual debugging) don't have to mint one;
+        /// production callers always pass it.
+        #[arg(long)]
+        enclave_id: Option<String>,
     },
 }
 
@@ -383,6 +392,7 @@ fn write_enclavia_config(
     container_port: u16,
     storage: bool,
     control_pubkey: Option<&str>,
+    enclave_id: Option<&str>,
 ) -> Result<()> {
     let mut config = serde_json::json!({
         "listen_vsock_port": 5000,
@@ -409,12 +419,17 @@ fn write_enclavia_config(
         config["control_public_key"] = serde_json::Value::String(pubkey.to_string());
     }
 
+    if let Some(id) = enclave_id {
+        config["enclave_id"] = serde_json::Value::String(id.to_string());
+    }
+
     let path = bundle_dir.join("enclavia-config.json");
     std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap())?;
     info!(
         container_port,
         storage,
         control_channel = control_pubkey.is_some(),
+        has_enclave_id = enclave_id.is_some(),
         "wrote enclavia config"
     );
     Ok(())
@@ -429,6 +444,7 @@ async fn build(
     debug: bool,
     storage: bool,
     control_pubkey: Option<&str>,
+    enclave_id: Option<&str>,
 ) -> Result<BuildResult> {
     let tmp = tempfile::tempdir()?;
     let tmp_path = tmp.path();
@@ -449,7 +465,7 @@ async fn build(
     patch_bundle_config(&bundle_dir)?;
 
     // 4. Write enclavia config into bundle
-    write_enclavia_config(&bundle_dir, container_port, storage, control_pubkey)?;
+    write_enclavia_config(&bundle_dir, container_port, storage, control_pubkey, enclave_id)?;
 
     // 5. Build the EIF
     info!(storage, "building enclave image");
@@ -491,6 +507,7 @@ async fn main() {
             debug,
             storage,
             control_pubkey,
+            enclave_id,
         } => {
             let creds = match (&registry_user, &registry_password) {
                 (Some(u), Some(p)) => Some((u.as_str(), p.as_str())),
@@ -513,6 +530,7 @@ async fn main() {
                 debug,
                 storage,
                 control_pubkey.as_deref(),
+                enclave_id.as_deref(),
             )
             .await
             {
