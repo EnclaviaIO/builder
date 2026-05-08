@@ -8,11 +8,10 @@ use tracing::{error, info};
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
-    #[error("command `{cmd}` failed with status {status}:\n{stderr}")]
+    #[error("command `{cmd}` failed with status {status} (see build log for stderr)")]
     Command {
         cmd: String,
         status: std::process::ExitStatus,
-        stderr: String,
     },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -103,24 +102,23 @@ struct BuildResult {
 async fn run_cmd(cmd: &str, args: &[&str]) -> Result<String> {
     info!(cmd, ?args, "running command");
 
+    // Inherit stderr so the child writes directly to our stderr FD. The
+    // backend line-streams the builder's stderr into the build log; piping
+    // here would buffer the child's stderr until exit and the user would
+    // see nothing for the duration of long commands like `nix build`.
+    // stdout stays piped — callers parse JSON from it.
     let output = Command::new(cmd)
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()?
         .wait_with_output()
         .await?;
-
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if !stderr.is_empty() {
-        info!(cmd, stderr = %stderr.trim(), "command stderr");
-    }
 
     if !output.status.success() {
         return Err(Error::Command {
             cmd: cmd.to_string(),
             status: output.status,
-            stderr,
         });
     }
 
