@@ -24,9 +24,61 @@ if [ -f "$CONFIG" ]; then
     done < "$CONFIG"
 fi
 
+# Optional egress test fixtures from kernel cmdline: the e2e egress harness
+# passes `enclavia.target_ip=X enclavia.target_port=Y` via QEMU `-append`,
+# which the workload reads from /etc/enclavia/egress-test.env. Real
+# enclaves never see these tokens, so the file just stays absent.
+TEST_TARGET_IP=""
+TEST_TARGET_PORT=""
+if [ -r /proc/cmdline ]; then
+    while IFS= read -r cmdline || [ -n "$cmdline" ]; do
+        for tok in $cmdline; do
+            case "$tok" in
+                enclavia.target_ip=*) TEST_TARGET_IP="${tok#enclavia.target_ip=}" ;;
+                enclavia.target_port=*) TEST_TARGET_PORT="${tok#enclavia.target_port=}" ;;
+            esac
+        done
+    done < /proc/cmdline
+fi
+
 # Bring up the loopback interface so enclavia-server can reach the container.
 /bin/ip link set lo up
 /bin/ip addr add 127.0.0.1/8 dev lo 2>/dev/null || true
+
+# --- Outbound network egress ---
+# When enclavia-egress is present, start it before crun so the workload's
+# default route through tun0 is in place by the time the container runs.
+# enclavia-egress owns /dev/net/tun, opens it, creates tun0 with the
+# configured local IP, and brings it up itself. We add the default route
+# once tun0 appears.
+if [ -x /bin/enclavia-egress ]; then
+    # Ensure /dev/net/tun exists. devtmpfs auto-creates it when CONFIG_TUN=y,
+    # but the parent directory /dev/net is only created when the first
+    # devtmpfs entry under it is registered; mknod ourselves if missing.
+    if [ ! -c /dev/net/tun ]; then
+        /bin/mkdir -p /dev/net
+        /bin/mknod /dev/net/tun c 10 200 2>/dev/null || true
+    fi
+
+    /bin/enclavia-egress >/tmp/egress.log 2>&1 &
+
+    # Wait for tun0 to come up.
+    i=0
+    while [ $i -lt 100 ]; do
+        if /bin/ip link show tun0 >/dev/null 2>&1; then
+            break
+        fi
+        /bin/sleep 0.1
+        i=$((i + 1))
+    done
+
+    if /bin/ip link show tun0 >/dev/null 2>&1; then
+        /bin/ip route add default dev tun0 2>/dev/null || true
+        echo "egress: tun0 up, default route installed"
+    else
+        echo "WARNING: tun0 did not come up; egress unavailable" >&2
+    fi
+fi
 
 # Pre-mount essential filesystems in the container rootfs.
 # The OCI config has all mounts stripped (they fail without mount namespace),
@@ -125,6 +177,17 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
         /bin/mkdir -p "$ROOTFS/data"
         /bin/mount --bind /data "$ROOTFS/data" 2>/dev/null || true
     fi
+fi
+
+# Plumb test-only egress targets to the workload via a known file. The
+# e2e harness sets `enclavia.target_ip=` / `enclavia.target_port=` on
+# the kernel command line; we surface them as `/etc/egress-test.env`
+# inside the OCI rootfs so the busybox workload can `.` it. A real
+# enclave's bundle would never look for this file.
+if [ -n "$TEST_TARGET_IP" ] && [ -n "$TEST_TARGET_PORT" ]; then
+    /bin/mkdir -p "$ROOTFS/etc"
+    printf 'TARGET_IP=%s\nTARGET_PORT=%s\n' "$TEST_TARGET_IP" "$TEST_TARGET_PORT" \
+        > "$ROOTFS/etc/egress-test.env"
 fi
 
 # Start the customer's container in the background using crun.

@@ -66,6 +66,7 @@
         enclaviaServerPkg = enclavia-crates.packages.${system}.enclavia-server;
         nbdClientPkg = enclavia-crates.packages.${system}.nbd-client;
         enclaviaCryptoPkg = enclavia-crates.packages.${system}.enclavia-crypto;
+        enclaviaEgressPkg = enclavia-crates.packages.${system}.enclavia-egress;
         mockKmsPkg = enclavia-crates.packages.${system}.mock-kms;
         nitroLib = nitro-util.lib.${system};
 
@@ -90,25 +91,25 @@
         };
 
         enclave = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
           ociBundlePath = oci-bundle;
         };
 
         enclave-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
           ociBundlePath = oci-bundle;
           debugMode = true;
         };
 
         enclave-storage = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg;
           ociBundlePath = oci-bundle;
           storageEnabled = true;
           customKernel = storageKernel;
         };
 
         enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg;
           ociBundlePath = oci-bundle;
           debugMode = true;
           storageEnabled = true;
@@ -185,13 +186,25 @@
         test-bundle = pkgs.callPackage ./nix/test-bundle.nix { inherit pkgs; };
 
         test-enclave = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
           ociBundlePath = test-bundle;
         };
 
         test-enclave-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
           ociBundlePath = test-bundle;
+          debugMode = true;
+        };
+
+        # --- Egress test bundle + enclave ---
+        # Minimal OCI bundle that opens TCP to TARGET_IP:TARGET_PORT (env vars
+        # set by the e2e wrapper), writes "ping\n", and exits 0 iff the reply
+        # is "pong\n". Used by tests/run_e2e_egress.sh.
+        test-egress-bundle = pkgs.callPackage ./nix/test-egress-bundle.nix { inherit pkgs; };
+
+        test-enclave-egress-debug = pkgs.callPackage ./nix/enclave.nix {
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
+          ociBundlePath = test-egress-bundle;
           debugMode = true;
         };
 
@@ -199,7 +212,7 @@
         test-storage-bundle = pkgs.callPackage ./nix/test-storage-bundle.nix { inherit pkgs; };
 
         test-enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg;
           ociBundlePath = test-storage-bundle;
           debugMode = true;
           storageEnabled = true;
@@ -210,7 +223,7 @@
         # against raw btrfs writes. Used to isolate proxy throughput from
         # cryptsetup overhead on TCG.
         test-enclave-storage-debug-no-luks = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg;
           ociBundlePath = test-storage-bundle;
           debugMode = true;
           storageEnabled = true;
@@ -393,6 +406,114 @@
           qemu-system-x86_64 "''${QEMU_ARGS[@]}"
         '';
 
+        egressHostBin = "${enclavia-crates.packages.${system}.egress-host-debug or (throw "egress-host not built; override enclavia-crates input")}/bin/enclavia-egress-host";
+
+        # Wrapper for the egress e2e test. UDS mode (not forward-cid) so the
+        # guest's CID-2 vsock 5006 connect()s land on ${PROXY}_5006, which
+        # egress-host listens on. The TARGET_IP / TARGET_PORT for the
+        # in-enclave workload are passed via the kernel command line; init.sh
+        # surfaces them as /etc/egress-test.env inside the OCI rootfs.
+        test-egress-vm = pkgs.writeShellScriptBin "enclavia-test-egress-vm" ''
+          set -euo pipefail
+
+          EIF_PATH="${test-enclave-egress-debug}/image.eif"
+          MEMORY="''${MEMORY:-4G}"
+          CPUS="''${CPUS:-2}"
+
+          # The in-enclave workload connects to TARGET_IP:TARGET_PORT. The
+          # destination must NOT be in 127.0.0.0/8 (the enclave's `lo` would
+          # grab it and the egress path would never see the SYN). The harness
+          # script chooses a host-routable IP, typically derived from
+          # `ip route get`, and passes it in.
+          : "''${TARGET_IP:?TARGET_IP not set (point at where egress-host can reach the echo server)}"
+          : "''${TARGET_PORT:?TARGET_PORT not set}"
+
+          GUEST_CID=4
+          EGRESS_VSOCK_PORT=5006
+
+          SOCK_DIR="$(${pkgs.coreutils}/bin/mktemp -d /tmp/enclave-egress-test.XXXXXX)"
+          VHOST_SOCKET="''${SOCK_DIR}/vhost.sock"
+          PROXY_SOCKET="''${SOCK_DIR}/proxy.sock"
+
+          cleanup() {
+              echo ""
+              echo "egress-test-vm: cleaning up..."
+              kill "''${HEARTBEAT_PID:-}" "''${VHOST_PID:-}" "''${EGRESS_PID:-}" 2>/dev/null || true
+              wait "''${HEARTBEAT_PID:-}" "''${VHOST_PID:-}" "''${EGRESS_PID:-}" 2>/dev/null || true
+              ${pkgs.coreutils}/bin/rm -rf "''${SOCK_DIR}"
+          }
+          trap cleanup EXIT
+
+          echo "egress-test-vm: socket dir   = ''${SOCK_DIR}"
+          echo "egress-test-vm: EIF          = ''${EIF_PATH}"
+          echo "egress-test-vm: target       = ''${TARGET_IP}:''${TARGET_PORT}"
+          echo "egress-test-vm: memory       = ''${MEMORY}, cpus = ''${CPUS}"
+
+          echo "egress-test-vm: starting vhost-device-vsock (CID ''${GUEST_CID}, UDS mode)..."
+          vhost-device-vsock \
+              --vm "guest-cid=''${GUEST_CID},socket=''${VHOST_SOCKET},uds-path=''${PROXY_SOCKET}" &
+          VHOST_PID=$!
+
+          for i in $(${pkgs.coreutils}/bin/seq 1 50); do
+              [ -S "''${VHOST_SOCKET}" ] && break
+              ${pkgs.coreutils}/bin/sleep 0.1
+          done
+          if [ ! -S "''${VHOST_SOCKET}" ]; then
+              echo "egress-test-vm: ERROR: vhost-device-vsock did not create socket" >&2
+              exit 1
+          fi
+
+          echo "egress-test-vm: starting heartbeat responder..."
+          ${pkgs.python3}/bin/python3 ${heartbeatScript} --uds "''${PROXY_SOCKET}_9000" &
+          HEARTBEAT_PID=$!
+
+          for i in $(${pkgs.coreutils}/bin/seq 1 50); do
+              [ -S "''${PROXY_SOCKET}_9000" ] && break
+              ${pkgs.coreutils}/bin/sleep 0.1
+          done
+
+          echo "egress-test-vm: starting egress-host on ''${PROXY_SOCKET}_''${EGRESS_VSOCK_PORT}..."
+          EGRESS_LISTEN_PATH="''${PROXY_SOCKET}_''${EGRESS_VSOCK_PORT}" \
+          RUST_LOG="''${RUST_LOG:-info}" \
+              ${egressHostBin} &
+          EGRESS_PID=$!
+
+          for i in $(${pkgs.coreutils}/bin/seq 1 50); do
+              [ -S "''${PROXY_SOCKET}_''${EGRESS_VSOCK_PORT}" ] && break
+              ${pkgs.coreutils}/bin/sleep 0.1
+          done
+          if [ ! -S "''${PROXY_SOCKET}_''${EGRESS_VSOCK_PORT}" ]; then
+              echo "egress-test-vm: ERROR: egress-host socket did not appear" >&2
+              exit 1
+          fi
+
+          echo ""
+          echo "  Watch the console output for 'egress-test:' messages."
+          echo "  The workload tries TARGET_IP:TARGET_PORT once and exits."
+          echo ""
+
+          # The nitro-enclave machine has its own `append=` option for the
+          # kernel command line; the top-level `-append` flag is masked. Pass
+          # the target plumbing as machine properties so init.sh sees them
+          # in /proc/cmdline.
+          QEMU_ARGS=(
+              -M "nitro-enclave,vsock=c,id=enclavia-egress-test,append=enclavia.target_ip=''${TARGET_IP} enclavia.target_port=''${TARGET_PORT}"
+              -chardev "socket,id=c,path=''${VHOST_SOCKET}"
+              -kernel "''${EIF_PATH}"
+              -nographic
+              -m "''${MEMORY}"
+              -smp "''${CPUS}"
+          )
+
+          if [ -e /dev/kvm ]; then
+              QEMU_ARGS+=(--enable-kvm -cpu host)
+          else
+              QEMU_ARGS+=(-cpu max)
+          fi
+
+          qemu-system-x86_64 "''${QEMU_ARGS[@]}"
+        '';
+
         test-debug-vm = pkgs.writeShellScriptBin "enclavia-test-debug-vm" ''
           set -euo pipefail
 
@@ -453,7 +574,7 @@
       in
       {
         packages = {
-          inherit builder enclave enclave-debug enclave-storage enclave-storage-debug debug-vm test-bundle test-enclave test-enclave-debug test-debug-vm test-storage-bundle test-enclave-storage-debug test-enclave-storage-debug-no-luks test-storage-vm;
+          inherit builder enclave enclave-debug enclave-storage enclave-storage-debug debug-vm test-bundle test-enclave test-enclave-debug test-debug-vm test-storage-bundle test-enclave-storage-debug test-enclave-storage-debug-no-luks test-storage-vm test-egress-bundle test-enclave-egress-debug test-egress-vm;
           default = builder;
         };
 
