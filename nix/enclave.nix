@@ -58,8 +58,20 @@ let
 
   initScript = pkgs.writeShellScript "enclave-init" (builtins.readFile ./init.sh);
 
+  # In-enclave validating DNS resolver (#136). Static musl build from
+  # nixpkgs so it drops cleanly into the initramfs with no shared-library
+  # closure to ship. The DNSSEC trust anchor and the runtime-substituted
+  # config template live next to it on the rootfs.
+  unboundPkg = pkgs.pkgsStatic.unbound;
+  unboundConfTemplate = ./unbound.conf.template;
+  # IANA DNSSEC root trust anchor, vendored from nixpkgs.dns-root-data.
+  # Vendoring rather than fetching at boot is intentional: the anchor
+  # file is hashed into the EIF, so any change to the anchor changes
+  # the PCRs and is auditable via `enclavia reproduce`.
+  rootKey = "${pkgs.dns-root-data}/root.key";
+
   rootfs = pkgs.runCommand "enclave-rootfs" {} ''
-    mkdir -p $out/bin $out/etc/enclavia $out/var/lib/oci
+    mkdir -p $out/bin $out/etc/enclavia $out/etc/unbound $out/var/lib/oci
 
     # Binaries
     cp ${enclaviaServerPkg}/bin/enclavia-server $out/bin/
@@ -75,6 +87,11 @@ let
     ln -s busybox $out/bin/sh
     ln -s busybox $out/bin/rm
     ln -s busybox $out/bin/mknod
+    ln -s busybox $out/bin/awk
+    ln -s busybox $out/bin/grep
+    ln -s busybox $out/bin/tr
+    ln -s busybox $out/bin/nc
+    ln -s busybox $out/bin/printf
 
     ${if storageEnabled && nbdClientPkg != null then ''
     # NBD client for enclave storage. The client also acts as a userspace
@@ -97,6 +114,15 @@ let
     # Egress daemon: owns /dev/net/tun, runs smoltcp on it, relays
     # outbound TCP to egress-host over vsock port 5006.
     cp ${enclaviaEgressPkg}/bin/enclavia-egress $out/bin/
+
+    # unbound + DNSSEC trust anchor for #136. unbound listens on
+    # 127.0.0.1:53, forwards over DNS-over-TCP through enclavia-egress
+    # to the operator-supplied resolvers. init.sh substitutes the
+    # forward-addr lines into the template at boot.
+    cp ${unboundPkg}/bin/unbound $out/bin/
+    cp ${unboundConfTemplate} $out/etc/unbound/unbound.conf.template
+    cp ${rootKey} $out/etc/unbound/root.key
+    chmod 0644 $out/etc/unbound/root.key
     '' else ""}
 
     # Init script — must be inside the rootfs since the init binary

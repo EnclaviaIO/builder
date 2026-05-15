@@ -73,6 +73,72 @@ if [ -x /bin/enclavia-egress ]; then
         echo "egress: e2e test allowlist installed for ${TEST_TARGET_IP}:${TEST_TARGET_PORT}"
     fi
 
+    # Render the unbound config from the template by substituting the
+    # resolvers from /etc/enclavia/egress.json. The shipped template has
+    # an `@FORWARD_ADDRS@` placeholder that we replace with one
+    # `forward-addr:` line per resolver. Hand-rolled JSON parser only:
+    # no jq in the rootfs, busybox awk is what we have.
+    #
+    # We only kick off unbound if the rootfs actually shipped it. The
+    # daemon is only present when enclavia-egress is, but storage-only
+    # / debug-only EIFs may still want the egress daemon without a real
+    # allowlist; in that case unbound stays running with an empty
+    # forward list, the daemon-side resolver call will fail, and
+    # hostname-allowlist entries will deny.
+    if [ -x /bin/unbound ] && [ -f /etc/unbound/unbound.conf.template ]; then
+        RESOLVERS=""
+        if [ -f /etc/enclavia/egress.json ]; then
+            # Extract IPv4 dotted quads under the `resolvers` array.
+            # Busybox awk + tr keeps us deps-free. The egress daemon will
+            # ALSO parse this same file and auto-inject the matching
+            # IP:53/tcp entries into its IP allowlist so unbound's own
+            # forwarder traffic is permitted (chicken-and-egg).
+            RESOLVERS=$(/bin/awk '
+                BEGIN { in_resolvers = 0 }
+                /"resolvers"[[:space:]]*:/ { in_resolvers = 1 }
+                in_resolvers {
+                    while (match($0, /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"/)) {
+                        ip = substr($0, RSTART + 1, RLENGTH - 2)
+                        print ip
+                        $0 = substr($0, RSTART + RLENGTH)
+                    }
+                    if (index($0, "]")) { in_resolvers = 0 }
+                }
+            ' /etc/enclavia/egress.json)
+        fi
+
+        FORWARD_ADDRS=""
+        for ip in $RESOLVERS; do
+            FORWARD_ADDRS="${FORWARD_ADDRS}    forward-addr: ${ip}@53
+"
+            echo "unbound: forwarding to ${ip}:53/tcp"
+        done
+        if [ -z "$FORWARD_ADDRS" ]; then
+            echo "unbound: WARNING: no resolvers in egress.json, hostname allowlist entries will deny" >&2
+        fi
+
+        /bin/mkdir -p /etc/unbound
+        # busybox awk lacks gensub on most builds; use a two-step:
+        # write resolvers to a temp file, splice it in with awk's
+        # getline. Avoid sed entirely (also missing from busybox here).
+        printf '%s' "$FORWARD_ADDRS" > /tmp/unbound-forward-addrs
+        /bin/awk -v F=/tmp/unbound-forward-addrs '
+            /@FORWARD_ADDRS@/ {
+                while ((getline line < F) > 0) print line
+                close(F)
+                next
+            }
+            { print }
+        ' /etc/unbound/unbound.conf.template > /etc/unbound/unbound.conf
+        /bin/rm -f /tmp/unbound-forward-addrs
+
+        # Start unbound. It listens on 127.0.0.1:53 once it's up; the
+        # readiness check below TCP-connects to that port in a loop
+        # (unbound-control is not in the rootfs, dig isn't either, but
+        # a plain TCP connect is enough to confirm the listener is up).
+        /bin/unbound -c /etc/unbound/unbound.conf -d >/tmp/unbound.log 2>&1 &
+    fi
+
     /bin/enclavia-egress >/tmp/egress.log 2>&1 &
 
     # Wait for tun0 to come up.
@@ -90,6 +156,23 @@ if [ -x /bin/enclavia-egress ]; then
         echo "egress: tun0 up, default route installed"
     else
         echo "WARNING: tun0 did not come up; egress unavailable" >&2
+    fi
+
+    # Wait for unbound to start listening on 127.0.0.1:53.
+    # busybox `nc -z` is the lightest available probe.
+    if [ -x /bin/unbound ]; then
+        i=0
+        while [ $i -lt 50 ]; do
+            if /bin/nc -z 127.0.0.1 53 2>/dev/null; then
+                echo "unbound: ready on 127.0.0.1:53"
+                break
+            fi
+            /bin/sleep 0.1
+            i=$((i + 1))
+        done
+        if [ $i -ge 50 ]; then
+            echo "WARNING: unbound did not become ready in 5s; hostname allowlist will deny" >&2
+        fi
     fi
 fi
 
