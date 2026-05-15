@@ -7,6 +7,7 @@
   debugMode ? false,
   nbdClientPkg ? null,
   enclaviaCryptoPkg ? null,
+  enclaviaEgressPkg ? null,
   storageEnabled ? false,
   customKernel ? null,
   # Diagnostic: skip LUKS and mount raw btrfs on the NBD device directly.
@@ -73,6 +74,7 @@ let
     ln -s busybox $out/bin/insmod
     ln -s busybox $out/bin/sh
     ln -s busybox $out/bin/rm
+    ln -s busybox $out/bin/mknod
 
     ${if storageEnabled && nbdClientPkg != null then ''
     # NBD client for enclave storage. The client also acts as a userspace
@@ -89,6 +91,12 @@ let
     cp ${pkgs.pkgsStatic.cryptsetup}/bin/cryptsetup $out/bin/
     cp ${pkgs.pkgsStatic.btrfs-progs}/bin/mkfs.btrfs $out/bin/
     cp ${pkgs.pkgsStatic.util-linux}/bin/blkid $out/bin/
+    '' else ""}
+
+    ${if enclaviaEgressPkg != null then ''
+    # Egress daemon: owns /dev/net/tun, runs smoltcp on it, relays
+    # outbound TCP to egress-host over vsock port 5006.
+    cp ${enclaviaEgressPkg}/bin/enclavia-egress $out/bin/
     '' else ""}
 
     # Init script — must be inside the rootfs since the init binary

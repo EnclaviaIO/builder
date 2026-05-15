@@ -276,6 +276,60 @@ fn patch_bundle_config(bundle_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Make the OCI bundle deterministic before passing it to `nix build`.
+///
+/// `nix build` ingests the bundle via `--override-input oci-bundle path:<dir>`,
+/// and `path:` narHashing folds in both file content and mtimes. Without this
+/// step the input narHash is fresh on every invocation, which propagates
+/// through `enclave-rootfs` → `user-initramfs.cpio.gz` → final EIF and
+/// changes PCR0/PCR2 every run (builder#10).
+///
+/// Two sources of nondeterminism, both addressed here:
+///
+/// 1. **mtimes** — `umoci unpack`, `patch_bundle_config`, and
+///    `write_enclavia_config` all create/touch files with the host's current
+///    time. We reset every entry's mtime/atime to the Unix epoch.
+/// 2. **umoci's bookkeeping files** — `umoci.json` records the host UID/GID
+///    used for the rootless unpack (varies across machines/users), and the
+///    `sha256_*.mtree` manifest embeds the unpack path, hostname, and a
+///    real-time `date:` header. Neither is consulted at enclave runtime, so
+///    we delete them outright.
+///
+/// Symlinks are skipped for the mtime reset — `set_file_times` would follow
+/// them and rewrite the target's times.
+fn normalize_bundle_for_nix(dir: &Path) -> Result<()> {
+    // 1. Strip umoci's per-host bookkeeping.
+    let mut removed = 0usize;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == "umoci.json" || (name.starts_with("sha256_") && name.ends_with(".mtree")) {
+            std::fs::remove_file(entry.path())?;
+            removed += 1;
+        }
+    }
+
+    // 2. Reset mtime/atime on everything that survives.
+    let epoch = filetime::FileTime::from_unix_time(0, 0);
+    let mut touched = 0usize;
+    for entry in walkdir::WalkDir::new(dir) {
+        let entry = entry.map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+        })?;
+        if entry.file_type().is_symlink() {
+            continue;
+        }
+        filetime::set_file_times(entry.path(), epoch, epoch)?;
+        touched += 1;
+    }
+    info!(
+        ?dir, removed_bookkeeping = removed, touched_entries = touched,
+        "normalized bundle for deterministic nix path-input"
+    );
+    Ok(())
+}
+
 /// Build the enclave EIF using nix, overriding the oci-bundle input.
 ///
 /// In production the deployment also overrides `enclavia-crates` with a
@@ -465,15 +519,18 @@ async fn build(
     // 4. Write enclavia config into bundle
     write_enclavia_config(&bundle_dir, container_port, storage, control_pubkey, enclave_id)?;
 
-    // 5. Build the EIF
+    // 5. Normalize bundle so `path:` narHashing is deterministic
+    normalize_bundle_for_nix(&bundle_dir)?;
+
+    // 6. Build the EIF
     info!(storage, "building enclave image");
     build_eif(&bundle_dir, &result_link, debug, storage).await?;
 
-    // 6. Read PCR values
+    // 7. Read PCR values
     let pcrs = read_pcrs(&result_link)?;
     info!(pcr0 = %pcrs.pcr0, pcr1 = %pcrs.pcr1, pcr2 = %pcrs.pcr2, "PCR values");
 
-    // 7. Copy artifacts to output
+    // 8. Copy artifacts to output
     copy_artifacts(&result_link, output_dir)?;
 
     Ok(BuildResult {
