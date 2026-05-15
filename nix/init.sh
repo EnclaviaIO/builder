@@ -60,6 +60,19 @@ if [ -x /bin/enclavia-egress ]; then
         /bin/mknod /dev/net/tun c 10 200 2>/dev/null || true
     fi
 
+    # Egress allowlist (#135). Missing/empty == deny-all. The e2e harness
+    # asks for an exact-target permit when `enclavia.target_ip=` /
+    # `enclavia.target_port=` are present on the kernel command line; real
+    # enclaves get their allowlist baked into the EIF at build time
+    # (CLI/backend wiring lives in #138, not yet here).
+    if [ -n "$TEST_TARGET_IP" ] && [ -n "$TEST_TARGET_PORT" ]; then
+        /bin/mkdir -p /etc/enclavia
+        printf '{ "version": 1, "egress": [ {"host":"%s","port":%s,"protocol":"tcp"} ] }\n' \
+            "$TEST_TARGET_IP" "$TEST_TARGET_PORT" \
+            > /etc/enclavia/egress.json
+        echo "egress: e2e test allowlist installed for ${TEST_TARGET_IP}:${TEST_TARGET_PORT}"
+    fi
+
     /bin/enclavia-egress >/tmp/egress.log 2>&1 &
 
     # Wait for tun0 to come up.
