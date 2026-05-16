@@ -74,12 +74,20 @@ enum Cli {
 
         /// Per-enclave identifier stamped into `enclavia-config.json` so two
         /// enclaves built from the same Docker image (and same other inputs)
-        /// still produce different PCRs. The value is opaque to the builder
-        /// — typically the backend's enclave UUID. Optional so direct
+        /// still produce different PCRs. The value is opaque to the builder,
+        /// typically the backend's enclave UUID. Optional so direct
         /// builder users (CI, manual debugging) don't have to mint one;
         /// production callers always pass it.
         #[arg(long)]
         enclave_id: Option<String>,
+
+        /// Path to the egress allowlist JSON (`{"version":1,"resolvers":[],
+        /// "egress":[...]}`). When set, the file is copied into the OCI
+        /// bundle as `egress.json`; `enclave.nix` then places it at
+        /// `/etc/enclavia/egress.json` in the rootfs. When unset, no file is
+        /// baked in: the in-enclave daemon defaults to deny-all.
+        #[arg(long)]
+        egress_allowlist: Option<PathBuf>,
     },
 }
 
@@ -487,6 +495,7 @@ fn write_enclavia_config(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build(
     image: &str,
     creds: Option<(&str, &str)>,
@@ -497,6 +506,7 @@ async fn build(
     storage: bool,
     control_pubkey: Option<&str>,
     enclave_id: Option<&str>,
+    egress_allowlist: Option<&Path>,
 ) -> Result<BuildResult> {
     let tmp = tempfile::tempdir()?;
     let tmp_path = tmp.path();
@@ -518,6 +528,17 @@ async fn build(
 
     // 4. Write enclavia config into bundle
     write_enclavia_config(&bundle_dir, container_port, storage, control_pubkey, enclave_id)?;
+
+    // 4b. If the caller supplied an egress allowlist, drop it into the
+    // bundle at a fixed name. `enclave.nix` checks for this path and
+    // installs the file at `/etc/enclavia/egress.json` in the rootfs.
+    // The file content is hashed into the EIF, so changing it changes
+    // PCR2 (rootfs) and is visible via `enclavia reproduce`.
+    if let Some(src) = egress_allowlist {
+        let dst = bundle_dir.join("egress.json");
+        std::fs::copy(src, &dst)?;
+        info!(src = ?src, dst = ?dst, "copied egress allowlist into bundle");
+    }
 
     // 5. Normalize bundle so `path:` narHashing is deterministic
     normalize_bundle_for_nix(&bundle_dir)?;
@@ -563,6 +584,7 @@ async fn main() {
             storage,
             control_pubkey,
             enclave_id,
+            egress_allowlist,
         } => {
             let creds = match (&registry_user, &registry_password) {
                 (Some(u), Some(p)) => Some((u.as_str(), p.as_str())),
@@ -586,6 +608,7 @@ async fn main() {
                 storage,
                 control_pubkey.as_deref(),
                 enclave_id.as_deref(),
+                egress_allowlist.as_deref(),
             )
             .await
             {

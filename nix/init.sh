@@ -62,12 +62,15 @@ if [ -x /bin/enclavia-egress ]; then
         /bin/mknod /dev/net/tun c 10 200 2>/dev/null || true
     fi
 
-    # Egress allowlist (#135). Missing/empty == deny-all. The e2e harness
-    # asks for an exact-target permit when `enclavia.target_ip=` /
-    # `enclavia.target_port=` are present on the kernel command line; real
-    # enclaves get their allowlist baked into the EIF at build time
-    # (CLI/backend wiring lives in #138, not yet here).
-    if [ -n "$TEST_TARGET_IP" ] && [ -n "$TEST_TARGET_PORT" ]; then
+    # Egress allowlist (#135 / #138). Missing/empty == deny-all. Real
+    # enclaves get their allowlist baked into the EIF at build time (the
+    # builder copies the caller's `--egress-allowlist` JSON into the
+    # rootfs at `/etc/enclavia/egress.json`). The e2e harness instead
+    # asks for an exact-target permit via `enclavia.target_ip=` /
+    # `enclavia.target_port=` on the kernel command line; that path only
+    # fires when no real allowlist is already in place.
+    if [ -n "$TEST_TARGET_IP" ] && [ -n "$TEST_TARGET_PORT" ] \
+       && [ ! -f /etc/enclavia/egress.json ]; then
         /bin/mkdir -p /etc/enclavia
         if [ -n "$TEST_RESOLVER" ]; then
             # `one.one.one.one` is the probe target (queried by nslookup

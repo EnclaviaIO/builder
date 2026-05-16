@@ -35,6 +35,14 @@ let
   bundleConfig = ociBundlePath + "/enclavia-config.json";
   hasCustomConfig = builtins.pathExists bundleConfig;
 
+  # Egress allowlist. The builder copies the user-supplied JSON into the
+  # bundle as `egress.json` (only when the caller passed
+  # `--egress-allowlist`). When present, the file is installed at
+  # `/etc/enclavia/egress.json` and the in-enclave daemon enforces it.
+  # When absent, no file is baked in and the daemon stays at deny-all.
+  bundleEgressAllowlist = ociBundlePath + "/egress.json";
+  hasEgressAllowlist = builtins.pathExists bundleEgressAllowlist;
+
   enclaviaConfig = if hasCustomConfig
     then bundleConfig
     else pkgs.writeText "enclavia-config.json" (builtins.toJSON ({
@@ -141,6 +149,13 @@ let
 
     # Enclavia config
     cp ${enclaviaConfig} $out/etc/enclavia/config.json
+
+    ${if hasEgressAllowlist then ''
+    # Egress allowlist (#138). The in-enclave daemon reads this at boot;
+    # init.sh only overwrites it when the e2e test fixtures are on the
+    # kernel command line.
+    cp ${bundleEgressAllowlist} $out/etc/enclavia/egress.json
+    '' else ""}
 
     # OCI bundle (customer's image)
     cp -r ${ociBundlePath} $out/var/lib/oci/bundle
