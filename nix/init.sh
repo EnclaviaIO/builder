@@ -320,6 +320,18 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
     fi
 fi
 
+# Point the workload's libc resolver at the in-enclave unbound. Public
+# base images typically ship `nameserver 8.8.8.8` in /etc/resolv.conf,
+# which would send hostname lookups straight to the public resolver and
+# bypass the unbound forward-zone (so the egress allowlist's hostname
+# entries would silently never work). We only overwrite when the egress
+# stack is in the rootfs; storage-only / non-egress builds keep whatever
+# resolv.conf the OCI image baked in.
+if [ -x /bin/enclavia-egress ]; then
+    /bin/mkdir -p "$ROOTFS/etc"
+    printf 'nameserver 127.0.0.1\noptions edns0\n' > "$ROOTFS/etc/resolv.conf"
+fi
+
 # Plumb test-only egress targets to the workload via a known file. The
 # e2e harness sets `enclavia.target_ip=` / `enclavia.target_port=` on
 # the kernel command line; we surface them as `/etc/egress-test.env`
