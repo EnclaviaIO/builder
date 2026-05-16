@@ -1,0 +1,84 @@
+# unbound.conf: in-enclave validating stub resolver.
+#
+# This template is shipped in the EIF rootfs. At boot, init.sh appends:
+#   * one `local-zone: "<host>." transparent` line per allow-listed
+#     hostname in /etc/enclavia/egress.json (each one punches a hole
+#     in the default-refuse below)
+#   * a single `forward-zone: "."` block with one `forward-addr:` line
+#     per resolver in /etc/enclavia/egress.json
+# The final config is written to /etc/unbound/unbound.conf before
+# unbound is started.
+#
+# Design notes:
+#  * `interface: 127.0.0.1`: only the in-enclave egress daemon (and the
+#    workload, indirectly) talks to unbound. No vsock listener.
+#  * `do-tcp: yes`, `do-udp: yes`: the listener side accepts both, so
+#    workload-side resolvers (busybox nslookup, libc getaddrinfo) work
+#    over UDP/53 on loopback. The egress-host on the host is TCP-only,
+#    so the *upstream* path is TCP (`forward-tcp-upstream: yes` below);
+#    these two settings are independent.
+#  * `do-ip4: yes`, `do-ip6: no`: IPv6 is denied at every other layer
+#    (enclavia-egress is IPv4-only, smoltcp is IPv4-only, egress-host
+#    relays only TCP/IPv4). Disabling here keeps unbound from issuing
+#    AAAA-shaped queries that would never be answerable.
+#  * `auto-trust-anchor-file: /etc/unbound/root.key`: DNSSEC trust
+#    anchor vendored from nixpkgs.dns-root-data at EIF build time. Any
+#    change to the anchor changes the rootfs hash, which changes PCRs,
+#    so the operator can detect anchor swaps via `enclavia reproduce`.
+#  * `chroot: ""`: the initramfs IS the rootfs; chroot() would fail.
+#  * `username: ""`: no /etc/passwd in the rootfs (no nss either).
+#    setuid(0) is a noop since we already run as root inside the EIF.
+#  * `local-zone: "." refuse`: default-deny for workload-visible queries.
+#    This is the workload-facing DNS leak mitigation: without it, the
+#    workload could resolve arbitrary names through unbound (it can
+#    still try to talk to the resolver directly over TCP/53, but that
+#    is the resolver-bypass concern tracked separately). The per-host
+#    `local-zone transparent` entries appended by init.sh override this
+#    for allow-listed names only. Unbound's own internal validation
+#    queries (DS/DNSKEY for parent zones) do not re-enter this check;
+#    they go straight to the forward-zone upstreams.
+
+server:
+    verbosity: 1
+    interface: 127.0.0.1
+    port: 53
+    do-ip4: yes
+    do-ip6: no
+    do-udp: yes
+    do-tcp: yes
+    prefer-ip6: no
+
+    # Required when running off the initramfs: no fork-detached pid file,
+    # no chroot, no privilege drop because there is no nss to look up a
+    # user with.
+    use-syslog: no
+    do-daemonize: no
+    pidfile: ""
+    chroot: ""
+    username: ""
+    directory: ""
+
+    # DNSSEC trust anchor (IANA root.key, vendored from dns-root-data).
+    auto-trust-anchor-file: "/etc/unbound/root.key"
+
+    # Modest cache sizes: workloads can run multi-GB but unbound's
+    # working set here is tiny (a handful of allow-listed names). Keep
+    # the footprint predictable.
+    msg-cache-size: 4m
+    rrset-cache-size: 8m
+
+    # Don't bother with hardening that requires syscalls our minimal
+    # init namespace can't support (e.g. setgid). The daemon is reached
+    # only over 127.0.0.1 from the same trust domain.
+    harden-glue: yes
+    harden-dnssec-stripped: yes
+    qname-minimisation: yes
+
+    # Logs go to stderr (which init.sh redirects into the boot log).
+    logfile: ""
+    log-queries: no
+
+    # Default-deny for client queries. init.sh appends one
+    # `local-zone: "<host>." transparent` per allow-listed hostname
+    # below; everything else gets REFUSED at the listener.
+    local-zone: "." refuse
