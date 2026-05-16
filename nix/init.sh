@@ -30,12 +30,14 @@ fi
 # enclaves never see these tokens, so the file just stays absent.
 TEST_TARGET_IP=""
 TEST_TARGET_PORT=""
+TEST_RESOLVER=""
 if [ -r /proc/cmdline ]; then
     while IFS= read -r cmdline || [ -n "$cmdline" ]; do
         for tok in $cmdline; do
             case "$tok" in
                 enclavia.target_ip=*) TEST_TARGET_IP="${tok#enclavia.target_ip=}" ;;
                 enclavia.target_port=*) TEST_TARGET_PORT="${tok#enclavia.target_port=}" ;;
+                enclavia.resolver=*) TEST_RESOLVER="${tok#enclavia.resolver=}" ;;
             esac
         done
     done < /proc/cmdline
@@ -67,17 +69,35 @@ if [ -x /bin/enclavia-egress ]; then
     # (CLI/backend wiring lives in #138, not yet here).
     if [ -n "$TEST_TARGET_IP" ] && [ -n "$TEST_TARGET_PORT" ]; then
         /bin/mkdir -p /etc/enclavia
-        printf '{ "version": 1, "egress": [ {"host":"%s","port":%s,"protocol":"tcp"} ] }\n' \
-            "$TEST_TARGET_IP" "$TEST_TARGET_PORT" \
-            > /etc/enclavia/egress.json
-        echo "egress: e2e test allowlist installed for ${TEST_TARGET_IP}:${TEST_TARGET_PORT}"
+        if [ -n "$TEST_RESOLVER" ]; then
+            # `one.one.one.one` is the probe target (queried by nslookup
+            # below once unbound is ready). Adding it as a hostname
+            # entry punches the necessary `local-zone transparent` hole
+            # in unbound's default-refuse policy. Nothing connects to it;
+            # it exists only so the resolver test can succeed.
+            printf '{ "version": 1, "resolvers": ["%s"], "egress": [ {"host":"%s","port":%s,"protocol":"tcp"}, {"host":"one.one.one.one","port":443,"protocol":"tcp"} ] }\n' \
+                "$TEST_RESOLVER" "$TEST_TARGET_IP" "$TEST_TARGET_PORT" \
+                > /etc/enclavia/egress.json
+            echo "egress: e2e test allowlist installed for ${TEST_TARGET_IP}:${TEST_TARGET_PORT}, resolver=${TEST_RESOLVER}, probe=one.one.one.one"
+        else
+            printf '{ "version": 1, "egress": [ {"host":"%s","port":%s,"protocol":"tcp"} ] }\n' \
+                "$TEST_TARGET_IP" "$TEST_TARGET_PORT" \
+                > /etc/enclavia/egress.json
+            echo "egress: e2e test allowlist installed for ${TEST_TARGET_IP}:${TEST_TARGET_PORT}"
+        fi
     fi
 
-    # Render the unbound config from the template by substituting the
-    # resolvers from /etc/enclavia/egress.json. The shipped template has
-    # an `@FORWARD_ADDRS@` placeholder that we replace with one
-    # `forward-addr:` line per resolver. Hand-rolled JSON parser only:
-    # no jq in the rootfs, busybox awk is what we have.
+    # Render the unbound config from the template. The template's
+    # `server:` block ends with `local-zone: "." refuse` (default-deny).
+    # We append, in order:
+    #   1. one `local-zone: "<host>." transparent` per allow-listed
+    #      hostname in egress.json (still inside the server: block,
+    #      since no new section header has appeared yet)
+    #   2. a single `forward-zone: "."` block listing the configured
+    #      resolvers as `forward-addr` lines
+    # The egress daemon parses the same egress.json and auto-injects
+    # matching `<resolver>:53/tcp` entries into its IP allowlist so
+    # unbound's outbound forwarder traffic is permitted.
     #
     # We only kick off unbound if the rootfs actually shipped it. The
     # daemon is only present when enclavia-egress is, but storage-only
@@ -87,50 +107,53 @@ if [ -x /bin/enclavia-egress ]; then
     # hostname-allowlist entries will deny.
     if [ -x /bin/unbound ] && [ -f /etc/unbound/unbound.conf.template ]; then
         RESOLVERS=""
+        HOSTNAMES=""
         if [ -f /etc/enclavia/egress.json ]; then
-            # Extract IPv4 dotted quads under the `resolvers` array.
-            # Busybox awk + tr keeps us deps-free. The egress daemon will
-            # ALSO parse this same file and auto-inject the matching
-            # IP:53/tcp entries into its IP allowlist so unbound's own
-            # forwarder traffic is permitted (chicken-and-egg).
-            RESOLVERS=$(/bin/awk '
-                BEGIN { in_resolvers = 0 }
-                /"resolvers"[[:space:]]*:/ { in_resolvers = 1 }
-                in_resolvers {
-                    while (match($0, /"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"/)) {
-                        ip = substr($0, RSTART + 1, RLENGTH - 2)
-                        print ip
-                        $0 = substr($0, RSTART + RLENGTH)
-                    }
-                    if (index($0, "]")) { in_resolvers = 0 }
-                }
+            # Resolvers are dotted-quad IPv4 strings under .resolvers.
+            RESOLVERS=$(/bin/jq -r '.resolvers // [] | .[]' /etc/enclavia/egress.json)
+            # Hostname allowlist entries: any .egress[].host that isn't
+            # a bare IPv4 (with optional /CIDR). The IPv4 case is handled
+            # purely at the egress daemon's L3 allowlist, no DNS involved.
+            HOSTNAMES=$(/bin/jq -r '
+                .egress // []
+                | .[]
+                | .host
+                | select(test("^[0-9.]+(/[0-9]+)?$") | not)
             ' /etc/enclavia/egress.json)
         fi
 
-        FORWARD_ADDRS=""
-        for ip in $RESOLVERS; do
-            FORWARD_ADDRS="${FORWARD_ADDRS}    forward-addr: ${ip}@53
-"
-            echo "unbound: forwarding to ${ip}:53/tcp"
-        done
-        if [ -z "$FORWARD_ADDRS" ]; then
+        /bin/mkdir -p /etc/unbound
+        /bin/cp /etc/unbound/unbound.conf.template /etc/unbound/unbound.conf
+
+        # Per-hostname allowlist overrides. These extend the server:
+        # block of the template (no new section header has been written
+        # yet), each one punching a hole in `local-zone: "." refuse`.
+        {
+            for host in $HOSTNAMES; do
+                printf '    local-zone: "%s." transparent\n' "$host"
+                echo "unbound: allow-listing $host" >&2
+            done
+        } >> /etc/unbound/unbound.conf
+
+        # Single forward-zone catching everything that survived the
+        # local-zone gate. Unbound also uses this zone for its own
+        # DNSSEC chain queries (DS/DNSKEY for parent zones), which are
+        # not subject to the local-zone refuse check.
+        {
+            echo ""
+            echo "forward-zone:"
+            echo "    name: \".\""
+            echo "    forward-tls-upstream: no"
+            echo "    forward-tcp-upstream: yes"
+            for ip in $RESOLVERS; do
+                printf '    forward-addr: %s@53\n' "$ip"
+                echo "unbound: forwarding to ${ip}:53/tcp" >&2
+            done
+        } >> /etc/unbound/unbound.conf
+
+        if [ -z "$RESOLVERS" ]; then
             echo "unbound: WARNING: no resolvers in egress.json, hostname allowlist entries will deny" >&2
         fi
-
-        /bin/mkdir -p /etc/unbound
-        # busybox awk lacks gensub on most builds; use a two-step:
-        # write resolvers to a temp file, splice it in with awk's
-        # getline. Avoid sed entirely (also missing from busybox here).
-        printf '%s' "$FORWARD_ADDRS" > /tmp/unbound-forward-addrs
-        /bin/awk -v F=/tmp/unbound-forward-addrs '
-            /@FORWARD_ADDRS@/ {
-                while ((getline line < F) > 0) print line
-                close(F)
-                next
-            }
-            { print }
-        ' /etc/unbound/unbound.conf.template > /etc/unbound/unbound.conf
-        /bin/rm -f /tmp/unbound-forward-addrs
 
         # Start unbound. It listens on 127.0.0.1:53 once it's up; the
         # readiness check below TCP-connects to that port in a loop
@@ -172,6 +195,25 @@ if [ -x /bin/enclavia-egress ]; then
         done
         if [ $i -ge 50 ]; then
             echo "WARNING: unbound did not become ready in 5s; hostname allowlist will deny" >&2
+        fi
+    fi
+
+    # Resolver probe (test-only): when the harness supplies a resolver via
+    # kernel cmdline, fire one nslookup through unbound to confirm the full
+    # forwarding chain (enclavia-egress -> vsock -> egress-host -> upstream)
+    # is actually moving DNS packets. Real enclaves do not run this probe.
+    if [ -n "$TEST_RESOLVER" ] && [ -x /bin/nslookup ]; then
+        echo "unbound-probe: querying one.one.one.one via 127.0.0.1"
+        if /bin/nslookup one.one.one.one 127.0.0.1 >/tmp/nslookup.log 2>&1; then
+            if /bin/grep -q "1.1.1.1\|1.0.0.1" /tmp/nslookup.log; then
+                echo "unbound-probe: SUCCESS"
+            else
+                echo "unbound-probe: FAILURE (unexpected response):"
+                /bin/awk '{print}' /tmp/nslookup.log >&2
+            fi
+        else
+            echo "unbound-probe: FAILURE (nslookup exit nonzero):"
+            /bin/awk '{print}' /tmp/nslookup.log >&2
         fi
     fi
 fi

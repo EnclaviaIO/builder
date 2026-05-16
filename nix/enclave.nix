@@ -92,6 +92,15 @@ let
     ln -s busybox $out/bin/tr
     ln -s busybox $out/bin/nc
     ln -s busybox $out/bin/printf
+    ln -s busybox $out/bin/nslookup
+    ln -s busybox $out/bin/cp
+    ln -s busybox $out/bin/cat
+
+    # jq for parsing /etc/enclavia/egress.json in init.sh. busybox awk
+    # works but is fragile on single-line JSON (the original awk
+    # forwarded-scoped resolvers list also matched IPs from the egress
+    # array). jq's grammar makes the queries explicit and short.
+    cp ${pkgs.pkgsStatic.jq}/bin/jq $out/bin/jq
 
     ${if storageEnabled && nbdClientPkg != null then ''
     # NBD client for enclave storage. The client also acts as a userspace

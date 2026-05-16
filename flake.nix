@@ -496,8 +496,12 @@
           # kernel command line; the top-level `-append` flag is masked. Pass
           # the target plumbing as machine properties so init.sh sees them
           # in /proc/cmdline.
+          APPEND="enclavia.target_ip=''${TARGET_IP} enclavia.target_port=''${TARGET_PORT}"
+          if [ -n "''${RESOLVER:-}" ]; then
+              APPEND="''${APPEND} enclavia.resolver=''${RESOLVER}"
+          fi
           QEMU_ARGS=(
-              -M "nitro-enclave,vsock=c,id=enclavia-egress-test,append=enclavia.target_ip=''${TARGET_IP} enclavia.target_port=''${TARGET_PORT}"
+              -M "nitro-enclave,vsock=c,id=enclavia-egress-test,append=''${APPEND}"
               -chardev "socket,id=c,path=''${VHOST_SOCKET}"
               -kernel "''${EIF_PATH}"
               -nographic
