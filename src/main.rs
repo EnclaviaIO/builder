@@ -340,11 +340,11 @@ fn normalize_bundle_for_nix(dir: &Path) -> Result<()> {
 
 /// Build the enclave EIF using nix, overriding the oci-bundle input.
 ///
-/// In production the deployment also overrides `enclavia-crates` with a
-/// pinned source path via the `ENCLAVIA_CRATES_FLAKE` env var; in dev the
-/// flake's default (`./dummy-enclavia-crates`) is replaced by passing
-/// `--override-input enclavia-crates path:/path/to/enclavia-crates` to the
-/// QEMU wrapper.
+/// In production the deployment also overrides `enclavia-crates` and
+/// `enclavia` with pinned source paths via the `ENCLAVIA_CRATES_FLAKE`
+/// and `ENCLAVIA_FLAKE` env vars; in dev the flake's defaults (`./dummy-*`)
+/// are replaced by passing `--override-input enclavia-crates path:...`
+/// and `--override-input enclavia path:...` to the QEMU wrapper.
 async fn build_eif(
     bundle_dir: &Path,
     result_link: &Path,
@@ -387,13 +387,20 @@ async fn build_eif(
         bundle_arg,
     ];
 
-    // ENCLAVIA_CRATES_FLAKE — production-side override so the in-enclave
-    // binaries (enclavia-server, enclavia-crypto, nbd-client, mock-kms)
-    // come from the deployment's pinned `inputs.enclavia-crates` rather
-    // than the dummy stub baked into the builder flake.
+    // ENCLAVIA_CRATES_FLAKE: production override for the closed-source
+    // host-side workspace (egress-host, storage-host).
     if let Some(p) = std::env::var_os("ENCLAVIA_CRATES_FLAKE") {
         args.push("--override-input".into());
         args.push("enclavia-crates".into());
+        args.push(format!("path:{}", PathBuf::from(p).display()));
+    }
+
+    // ENCLAVIA_FLAKE: production override for the public Enclavia
+    // workspace (enclavia-server, enclavia-egress, enclavia-crypto,
+    // nbd-client, mock-kms).
+    if let Some(p) = std::env::var_os("ENCLAVIA_FLAKE") {
+        args.push("--override-input".into());
+        args.push("enclavia".into());
         args.push(format!("path:{}", PathBuf::from(p).display()));
     }
 
