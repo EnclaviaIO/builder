@@ -23,16 +23,24 @@
       flake = false;
     };
 
-    # All in-enclave Rust crates (enclavia-server, enclavia-crypto,
-    # nbd-client, mock-kms, storage-host) live in enclavia-crates and
-    # come through this single input. Override at build time:
+    # Host-side packages (egress-host, storage-host) live in the
+    # closed-source enclavia-crates. Override at build time:
     #   --override-input enclavia-crates path:../enclavia-crates
     enclavia-crates = {
       url = "path:./dummy-enclavia-crates";
     };
+
+    # In-enclave services (enclavia-server, enclavia-crypto, nbd-client,
+    # enclavia-egress) plus the dev-only mock-kms live in the public
+    # EnclaviaIO/enclavia workspace. Path-based dummy default so the
+    # flake builds standalone without network; override during dev
+    # with `--override-input enclavia path:../enclavia`.
+    enclavia = {
+      url = "path:./dummy-enclavia";
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, nitro-util, oci-bundle, enclavia-crates }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, nitro-util, oci-bundle, enclavia-crates, enclavia }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
@@ -63,11 +71,14 @@
         });
 
         # --- Enclave EIF ---
-        enclaviaServerPkg = enclavia-crates.packages.${system}.enclavia-server;
-        nbdClientPkg = enclavia-crates.packages.${system}.nbd-client;
-        enclaviaCryptoPkg = enclavia-crates.packages.${system}.enclavia-crypto;
-        enclaviaEgressPkg = enclavia-crates.packages.${system}.enclavia-egress;
-        mockKmsPkg = enclavia-crates.packages.${system}.mock-kms;
+        # In-enclave packages + mock-kms come from the public EnclaviaIO/enclavia
+        # workspace. Host-side packages (storage-host, egress-host) still
+        # come from `enclavia-crates` further below.
+        enclaviaServerPkg = enclavia.packages.${system}.enclavia-server;
+        nbdClientPkg = enclavia.packages.${system}.nbd-client;
+        enclaviaCryptoPkg = enclavia.packages.${system}.enclavia-crypto;
+        enclaviaEgressPkg = enclavia.packages.${system}.enclavia-egress;
+        mockKmsPkg = enclavia.packages.${system}.mock-kms;
         nitroLib = nitro-util.lib.${system};
 
         # Test KMS key ID seeded into the bootstrap blob (first 4KB of the
