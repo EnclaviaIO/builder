@@ -172,17 +172,15 @@ if [ -x /bin/enclavia-egress ]; then
     # entries it loaded, what resolver entries got auto-injected, and
     # any per-flow deny warnings. Without this, the daemon's tracing
     # output is trapped in /tmp/egress.log inside the EIF and the only
-    # way to inspect it is to crash-dump the VM.
+    # way to inspect it is to crash-dump the VM. We tail directly to
+    # stderr (busybox sed isn't in the rootfs, so no prefix).
     (
-        # Wait briefly for the daemon to create the file, then mirror
-        # its tail to stderr (which lands on the serial console via
-        # init.sh's standard fds).
         i=0
         while [ $i -lt 50 ] && [ ! -f /tmp/egress.log ]; do
             /bin/sleep 0.1
             i=$((i + 1))
         done
-        /bin/tail -F /tmp/egress.log 2>/dev/null | /bin/sed 's/^/egress-daemon: /' >&2 &
+        /bin/tail -F /tmp/egress.log >&2 2>/dev/null &
     ) &
 
     # Wait for tun0 to come up.
