@@ -167,6 +167,24 @@ if [ -x /bin/enclavia-egress ]; then
 
     /bin/enclavia-egress >/tmp/egress.log 2>&1 &
 
+    # Make the egress daemon's startup logs visible on the serial
+    # console so operators (and the dashboard) can see what allowlist
+    # entries it loaded, what resolver entries got auto-injected, and
+    # any per-flow deny warnings. Without this, the daemon's tracing
+    # output is trapped in /tmp/egress.log inside the EIF and the only
+    # way to inspect it is to crash-dump the VM.
+    (
+        # Wait briefly for the daemon to create the file, then mirror
+        # its tail to stderr (which lands on the serial console via
+        # init.sh's standard fds).
+        i=0
+        while [ $i -lt 50 ] && [ ! -f /tmp/egress.log ]; do
+            /bin/sleep 0.1
+            i=$((i + 1))
+        done
+        /bin/tail -F /tmp/egress.log 2>/dev/null | /bin/sed 's/^/egress-daemon: /' >&2 &
+    ) &
+
     # Wait for tun0 to come up.
     i=0
     while [ $i -lt 100 ]; do
