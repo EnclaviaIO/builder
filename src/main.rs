@@ -271,15 +271,26 @@ fn patch_bundle_config(bundle_dir: &Path) -> Result<()> {
     let patched = serde_json::to_string_pretty(&config)?;
     std::fs::write(&config_path, patched)?;
 
-    // Ensure /etc/resolv.conf exists in the container rootfs.
-    // Docker normally bind-mounts this, but crun on initramfs doesn't.
-    // Without it, some images (e.g. nginx) fail to start.
+    // Point /etc/resolv.conf at the in-enclave unbound on 127.0.0.1.
+    // **Always overwrite** — the previous `if !resolv.exists()` branch
+    // silently left a pre-populated resolv.conf in place, which is the
+    // common case for Debian / Alpine / Ubuntu base images. The workload
+    // would then `getaddrinfo` against whatever nameservers the base
+    // image baked in (Docker's `127.0.0.11`, or unreachable public
+    // resolvers, or nothing) and fail with `EAI_AGAIN` even for
+    // destinations that were correctly listed in the egress allowlist.
+    // See pre-beta egress verification trace where every probe came
+    // back `URLError:[Errno -3] Temporary failure in name resolution`.
+    //
+    // For enclaves *without* an egress allowlist the in-enclave unbound
+    // is not started, so connections to 127.0.0.1:53 fail fast — that
+    // matches the "no egress" UX (no outbound, including DNS) and is
+    // the right failure mode. We don't need to handle the no-egress
+    // case specially.
     let resolv = bundle_dir.join("rootfs/etc/resolv.conf");
-    if !resolv.exists() {
-        std::fs::create_dir_all(bundle_dir.join("rootfs/etc"))?;
-        std::fs::write(&resolv, "nameserver 127.0.0.1\n")?;
-        info!("created missing /etc/resolv.conf in container rootfs");
-    }
+    std::fs::create_dir_all(bundle_dir.join("rootfs/etc"))?;
+    std::fs::write(&resolv, "nameserver 127.0.0.1\n")?;
+    info!("wrote /etc/resolv.conf in container rootfs");
 
     Ok(())
 }
