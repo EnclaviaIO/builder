@@ -32,11 +32,17 @@
 
     # In-enclave services (enclavia-server, enclavia-crypto, nbd-client,
     # enclavia-egress) plus the dev-only mock-kms live in the public
-    # EnclaviaIO/enclavia workspace. Path-based dummy default so the
-    # flake builds standalone without network; override during dev
-    # with `--override-input enclavia path:../enclavia`.
+    # EnclaviaIO/enclavia workspace. Default to a fetchable URL so
+    # `nix build .#builder` works out of the box and `enclavia
+    # reproduce` works for users with only the public repos. The
+    # `git+ssh://` scheme uses the operator's GitHub SSH key, which
+    # works today while the repo finishes its visibility flip; swap
+    # this to `github:EnclaviaIO/enclavia` once it's public and
+    # external (unauthenticated) builds will Just Work.
+    # Override during local development with
+    # `--override-input enclavia path:../enclavia`.
     enclavia = {
-      url = "path:./dummy-enclavia";
+      url = "git+ssh://git@github.com/EnclaviaIO/enclavia?ref=master";
     };
   };
 
@@ -65,9 +71,31 @@
 
         builderCargoArtifacts = craneLib.buildDepsOnly builderCommonArgs;
 
+        # The builder shells out to `skopeo` (pull OCI image), `umoci`
+        # (unpack to a runtime bundle), and `nix` (drive the EIF build).
+        # `nix` is a reasonable PATH assumption (you can't install the
+        # builder without it), but `skopeo` and `umoci` aren't, so wrap
+        # them into the binary's PATH at install time. Without this,
+        # `BUILDER_PATH=result/bin/builder enclavia reproduce <id>`
+        # trips on `skopeo: No such file or directory` on the very first
+        # call.
+        #
+        # We do NOT bake a default `BUILDER_FLAKE`. The flake source
+        # determines the recipe used to build the EIF and therefore the
+        # PCRs the comparison will produce: defaulting to `self` would
+        # silently make the local rebuild use this binary's own source
+        # tree, which is almost never the rev the backend was deployed
+        # from. Callers (the `enclavia` CLI, deployment systemd units)
+        # must pass `BUILDER_FLAKE` explicitly, ideally pointing at the
+        # rev the backend recorded for the enclave being reproduced.
         builder = craneLib.buildPackage (builderCommonArgs // {
           cargoArtifacts = builderCargoArtifacts;
           doCheck = false;
+          nativeBuildInputs = (builderCommonArgs.nativeBuildInputs or []) ++ [ pkgs.makeWrapper ];
+          postInstall = ''
+            wrapProgram $out/bin/builder \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.skopeo pkgs.umoci ]}
+          '';
         });
 
         # --- Enclave EIF ---
