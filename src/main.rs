@@ -333,9 +333,7 @@ fn normalize_bundle_for_nix(dir: &Path) -> Result<()> {
     let epoch = filetime::FileTime::from_unix_time(0, 0);
     let mut touched = 0usize;
     for entry in walkdir::WalkDir::new(dir) {
-        let entry = entry.map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-        })?;
+        let entry = entry.map_err(|e| std::io::Error::other(e.to_string()))?;
         if entry.file_type().is_symlink() {
             continue;
         }
