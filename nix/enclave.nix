@@ -103,6 +103,7 @@ let
     ln -s busybox $out/bin/nslookup
     ln -s busybox $out/bin/cp
     ln -s busybox $out/bin/cat
+    ln -s busybox $out/bin/tail
 
     # jq for parsing /etc/enclavia/egress.json in init.sh. busybox awk
     # works but is fragile on single-line JSON (the original awk
