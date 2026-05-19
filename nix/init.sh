@@ -167,22 +167,6 @@ if [ -x /bin/enclavia-egress ]; then
 
     /bin/enclavia-egress >/tmp/egress.log 2>&1 &
 
-    # Make the egress daemon's startup logs visible on the serial
-    # console so operators (and the dashboard) can see what allowlist
-    # entries it loaded, what resolver entries got auto-injected, and
-    # any per-flow deny warnings. Without this, the daemon's tracing
-    # output is trapped in /tmp/egress.log inside the EIF and the only
-    # way to inspect it is to crash-dump the VM. We tail directly to
-    # stderr (busybox sed isn't in the rootfs, so no prefix).
-    (
-        i=0
-        while [ $i -lt 50 ] && [ ! -f /tmp/egress.log ]; do
-            /bin/sleep 0.1
-            i=$((i + 1))
-        done
-        /bin/tail -F /tmp/egress.log >&2 2>/dev/null &
-    ) &
-
     # Wait for tun0 to come up.
     i=0
     while [ $i -lt 100 ]; do
@@ -214,6 +198,38 @@ if [ -x /bin/enclavia-egress ]; then
         done
         if [ $i -ge 50 ]; then
             echo "WARNING: unbound did not become ready in 5s; hostname allowlist will deny" >&2
+        fi
+    fi
+
+    # Pre-warm unbound's upstream forwarder. The first DNS query the
+    # workload sends would otherwise race unbound's outbound TCP
+    # handshake (egress-daemon → vsock → egress-host → upstream): the
+    # default unbound forward timeout (~376ms) is shorter than the
+    # cold-start dial, so the workload's very first lookup comes back
+    # SERVFAIL even when the allowlist permits it. Subsequent lookups
+    # reuse the warm TCP connection and resolve fine.
+    #
+    # Fix it cheaply for now by firing one best-effort lookup for the
+    # first allowlisted hostname before crun spawns the workload. The
+    # first iteration probably fails (cold dial); we retry a few times
+    # at 1s intervals until it succeeds, then move on. Proper fix is to
+    # have unbound pre-establish the TCP forwarder at startup (or bump
+    # its `tcp-idle-timeout`); see issue link in the workaround comment.
+    if [ -x /bin/nslookup ] && [ -f /etc/enclavia/egress.json ]; then
+        WARMUP_HOST=$(/bin/jq -r '
+            .egress // []
+            | .[]
+            | .host
+            | select(test("^[0-9.]+(/[0-9]+)?$") | not)
+        ' /etc/enclavia/egress.json | /bin/awk 'NR==1')
+        if [ -n "$WARMUP_HOST" ]; then
+            for i in 1 2 3 4 5; do
+                if /bin/nslookup "$WARMUP_HOST" 127.0.0.1 >/dev/null 2>&1; then
+                    echo "unbound: pre-warmed upstream forwarder via $WARMUP_HOST"
+                    break
+                fi
+                /bin/sleep 1
+            done
         fi
     fi
 
