@@ -3,7 +3,7 @@
   # Override at build time:
   #   --override-input enclavia path:/path/to/enclavia
   # or
-  #   --override-input enclavia git+ssh://git@github.com/EnclaviaIO/enclavia?ref=main
+  #   --override-input enclavia github:EnclaviaIO/enclavia
   description = "enclavia stub";
   inputs.flake-utils.url = "github:numtide/flake-utils";
   outputs = { self, flake-utils }:
