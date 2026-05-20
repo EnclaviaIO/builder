@@ -375,6 +375,19 @@ if [ -n "$TEST_TARGET_IP" ] && [ -n "$TEST_TARGET_PORT" ]; then
         > "$ROOTFS/etc/egress-test.env"
 fi
 
+# Per-enclave secrets injection (#169). Pull the host-side snapshot
+# from vsock 5004 and splice the entries into the OCI bundle's
+# `process.env` before crun reads the config. The binary exits 0
+# cleanly when no host-side daemon is listening (the backend only
+# starts `secrets-host` when the enclave has secrets configured),
+# so it is always safe to invoke. Failures are fatal here: dropping
+# secrets silently would let workloads boot with the wrong (or no)
+# credentials, which is worse than refusing to start. We tee stderr
+# into the serial log via the normal init stderr stream.
+if [ -x /bin/enclavia-secrets-init ]; then
+    /bin/enclavia-secrets-init /var/lib/oci/bundle
+fi
+
 # Start the customer's container in the background using crun.
 # --no-pivot: use chroot instead of pivot_root (required on initramfs)
 /bin/crun run --no-pivot --bundle /var/lib/oci/bundle customer &
