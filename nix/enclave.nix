@@ -8,6 +8,10 @@
   nbdClientPkg ? null,
   enclaviaCryptoPkg ? null,
   enclaviaEgressPkg ? null,
+  # Per-enclave secrets injector (#169). Optional only because some
+  # one-off test EIFs callPackage this file with a hand-built attrset;
+  # the flake's regular invocations always supply it.
+  enclaviaSecretsInitPkg ? null,
   storageEnabled ? false,
   customKernel ? null,
   # Diagnostic: skip LUKS and mount raw btrfs on the NBD device directly.
@@ -84,6 +88,16 @@ let
     # Binaries
     cp ${enclaviaServerPkg}/bin/enclavia-server $out/bin/
     cp ${pkgs.crun}/bin/crun $out/bin/
+
+    ${if enclaviaSecretsInitPkg != null then ''
+    # Per-enclave secrets injector (#169). init.sh dials vsock 5004 via
+    # this binary right before `crun start` to pull the host-side
+    # secrets snapshot and splice it into the OCI bundle's process.env.
+    # Exits 0 cleanly when no host-side daemon is listening (the
+    # backend only starts `secrets-host` when the enclave has secrets
+    # configured), so it is always safe to invoke.
+    cp ${enclaviaSecretsInitPkg}/bin/enclavia-secrets-init $out/bin/
+    '' else ""}
 
     # Minimal busybox for networking setup (ip link set lo up)
     cp ${pkgs.pkgsStatic.busybox}/bin/busybox $out/bin/busybox

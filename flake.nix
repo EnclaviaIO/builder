@@ -102,6 +102,7 @@
         nbdClientPkg = enclavia.packages.${system}.nbd-client;
         enclaviaCryptoPkg = enclavia.packages.${system}.enclavia-crypto;
         enclaviaEgressPkg = enclavia.packages.${system}.enclavia-egress;
+        enclaviaSecretsInitPkg = enclavia.packages.${system}.enclavia-secrets-init;
         mockKmsPkg = enclavia.packages.${system}.mock-kms;
         nitroLib = nitro-util.lib.${system};
 
@@ -126,25 +127,25 @@
         };
 
         enclave = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = oci-bundle;
         };
 
         enclave-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = oci-bundle;
           debugMode = true;
         };
 
         enclave-storage = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = oci-bundle;
           storageEnabled = true;
           customKernel = storageKernel;
         };
 
         enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = oci-bundle;
           debugMode = true;
           storageEnabled = true;
@@ -221,12 +222,12 @@
         test-bundle = pkgs.callPackage ./nix/test-bundle.nix { inherit pkgs; };
 
         test-enclave = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = test-bundle;
         };
 
         test-enclave-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = test-bundle;
           debugMode = true;
         };
@@ -257,7 +258,7 @@
         test-egress-bundle = pkgs.callPackage ./nix/test-egress-bundle.nix { inherit pkgs; };
 
         test-enclave-egress-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = test-egress-bundle;
           debugMode = true;
         };
@@ -266,7 +267,7 @@
         test-storage-bundle = pkgs.callPackage ./nix/test-storage-bundle.nix { inherit pkgs; };
 
         test-enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = test-storage-bundle;
           debugMode = true;
           storageEnabled = true;
@@ -277,7 +278,7 @@
         # against raw btrfs writes. Used to isolate proxy throughput from
         # cryptsetup overhead on TCG.
         test-enclave-storage-debug-no-luks = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = test-storage-bundle;
           debugMode = true;
           storageEnabled = true;
