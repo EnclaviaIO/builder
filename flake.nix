@@ -231,6 +231,25 @@
           debugMode = true;
         };
 
+        # --- WS test bundle + enclave ---
+        # OCI bundle whose entrypoint is the `ws-echo-test` binary built
+        # in the enclavia-crates workspace (a tokio-tungstenite echo
+        # server bound to 0.0.0.0:8080). Used by tests/run_e2e_ws.sh to
+        # drive a real WebSocket upgrade end-to-end through router +
+        # enclavia-server + crun.
+        wsEchoBin = enclavia-crates.packages.${system}.ws-echo-test
+          or (throw "ws-echo-test not built; override enclavia-crates input");
+
+        test-ws-bundle = pkgs.callPackage ./nix/test-ws-bundle.nix {
+          inherit pkgs wsEchoBin;
+        };
+
+        test-enclave-ws-debug = pkgs.callPackage ./nix/enclave.nix {
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
+          ociBundlePath = test-ws-bundle;
+          debugMode = true;
+        };
+
         # --- Egress test bundle + enclave ---
         # Minimal OCI bundle that opens TCP to TARGET_IP:TARGET_PORT (env vars
         # set by the e2e wrapper), writes "ping\n", and exits 0 iff the reply
@@ -613,7 +632,7 @@
       in
       {
         packages = {
-          inherit builder enclave enclave-debug enclave-storage enclave-storage-debug debug-vm test-bundle test-enclave test-enclave-debug test-debug-vm test-storage-bundle test-enclave-storage-debug test-enclave-storage-debug-no-luks test-storage-vm test-egress-bundle test-enclave-egress-debug test-egress-vm;
+          inherit builder enclave enclave-debug enclave-storage enclave-storage-debug debug-vm test-bundle test-enclave test-enclave-debug test-debug-vm test-storage-bundle test-enclave-storage-debug test-enclave-storage-debug-no-luks test-storage-vm test-egress-bundle test-enclave-egress-debug test-egress-vm test-ws-bundle test-enclave-ws-debug;
           default = builder;
         };
 
