@@ -59,7 +59,11 @@ in pkgs.runCommand "test-ws-oci-bundle" {} ''
   # closureInfo derivation enumerates the runtime deps for us.
   mkdir -p $out/rootfs/nix/store
   for path in $(cat ${closure}/store-paths); do
-    cp -r --no-preserve=mode "$path" $out/rootfs/nix/store/
+    # Preserve the original modes so the dynamic loader (ld-linux) keeps
+    # its +x bit; otherwise crun's `exec ws-echo-test` returns
+    # `Permission denied` because the kernel cannot run the interpreter.
+    cp -r "$path" $out/rootfs/nix/store/
+    chmod -R u+w "$out/rootfs/nix/store/$(basename "$path")"
   done
 
   cp ${config} $out/config.json
