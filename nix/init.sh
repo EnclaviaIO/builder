@@ -31,6 +31,7 @@ fi
 TEST_TARGET_IP=""
 TEST_TARGET_PORT=""
 TEST_RESOLVER=""
+TEST_SECRETS_MODE=""
 if [ -r /proc/cmdline ]; then
     while IFS= read -r cmdline || [ -n "$cmdline" ]; do
         for tok in $cmdline; do
@@ -38,6 +39,7 @@ if [ -r /proc/cmdline ]; then
                 enclavia.target_ip=*) TEST_TARGET_IP="${tok#enclavia.target_ip=}" ;;
                 enclavia.target_port=*) TEST_TARGET_PORT="${tok#enclavia.target_port=}" ;;
                 enclavia.resolver=*) TEST_RESOLVER="${tok#enclavia.resolver=}" ;;
+                enclavia.secrets_mode=*) TEST_SECRETS_MODE="${tok#enclavia.secrets_mode=}" ;;
             esac
         done
     done < /proc/cmdline
@@ -373,6 +375,15 @@ if [ -n "$TEST_TARGET_IP" ] && [ -n "$TEST_TARGET_PORT" ]; then
     /bin/mkdir -p "$ROOTFS/etc"
     printf 'TARGET_IP=%s\nTARGET_PORT=%s\n' "$TEST_TARGET_IP" "$TEST_TARGET_PORT" \
         > "$ROOTFS/etc/egress-test.env"
+fi
+
+# Per-enclave-secrets e2e (#169): surface enclavia.secrets_mode= so the
+# workload can branch its expectations between the inject / empty test
+# variants. Same convention as egress-test.env above. Real enclaves
+# never set this token.
+if [ -n "$TEST_SECRETS_MODE" ]; then
+    /bin/mkdir -p "$ROOTFS/etc"
+    printf '%s\n' "$TEST_SECRETS_MODE" > "$ROOTFS/etc/secrets-test.mode"
 fi
 
 # Per-enclave secrets injection (#169). Pull the host-side snapshot
