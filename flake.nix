@@ -102,6 +102,7 @@
         nbdClientPkg = enclavia.packages.${system}.nbd-client;
         enclaviaCryptoPkg = enclavia.packages.${system}.enclavia-crypto;
         enclaviaEgressPkg = enclavia.packages.${system}.enclavia-egress;
+        enclaviaSecretsInitPkg = enclavia.packages.${system}.enclavia-secrets-init;
         mockKmsPkg = enclavia.packages.${system}.mock-kms;
         nitroLib = nitro-util.lib.${system};
 
@@ -126,25 +127,25 @@
         };
 
         enclave = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = oci-bundle;
         };
 
         enclave-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = oci-bundle;
           debugMode = true;
         };
 
         enclave-storage = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = oci-bundle;
           storageEnabled = true;
           customKernel = storageKernel;
         };
 
         enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = oci-bundle;
           debugMode = true;
           storageEnabled = true;
@@ -221,12 +222,12 @@
         test-bundle = pkgs.callPackage ./nix/test-bundle.nix { inherit pkgs; };
 
         test-enclave = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = test-bundle;
         };
 
         test-enclave-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = test-bundle;
           debugMode = true;
         };
@@ -257,8 +258,23 @@
         test-egress-bundle = pkgs.callPackage ./nix/test-egress-bundle.nix { inherit pkgs; };
 
         test-enclave-egress-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = test-egress-bundle;
+          debugMode = true;
+        };
+
+        # --- Secrets test bundle + enclave (#169) ---
+        # Minimal OCI bundle whose entrypoint inspects SECRET_BIN /
+        # SECRET_TEXT in its env and prints assertion markers to the
+        # serial console. The bundle is the same across the inject /
+        # empty / skip-host runs; the host harness varies only the
+        # SECRETS_PAYLOAD passed on stdin to secrets-host (and the
+        # presence of the daemon itself).
+        test-secrets-bundle = pkgs.callPackage ./nix/test-secrets-bundle.nix { inherit pkgs; };
+
+        test-enclave-secrets-debug = pkgs.callPackage ./nix/enclave.nix {
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
+          ociBundlePath = test-secrets-bundle;
           debugMode = true;
         };
 
@@ -266,7 +282,7 @@
         test-storage-bundle = pkgs.callPackage ./nix/test-storage-bundle.nix { inherit pkgs; };
 
         test-enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = test-storage-bundle;
           debugMode = true;
           storageEnabled = true;
@@ -277,7 +293,7 @@
         # against raw btrfs writes. Used to isolate proxy throughput from
         # cryptsetup overhead on TCG.
         test-enclave-storage-debug-no-luks = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = test-storage-bundle;
           debugMode = true;
           storageEnabled = true;
@@ -462,6 +478,8 @@
 
         egressHostBin = "${enclavia-crates.packages.${system}.egress-host-debug or (throw "egress-host not built; override enclavia-crates input")}/bin/enclavia-egress-host";
 
+        secretsHostBin = "${enclavia-crates.packages.${system}.secrets-host-debug or (throw "secrets-host not built; override enclavia-crates input")}/bin/enclavia-secrets-host";
+
         # Wrapper for the egress e2e test. UDS mode (not forward-cid) so the
         # guest's CID-2 vsock 5006 connect()s land on ${PROXY}_5006, which
         # egress-host listens on. The TARGET_IP / TARGET_PORT for the
@@ -572,6 +590,129 @@
           qemu-system-x86_64 "''${QEMU_ARGS[@]}"
         '';
 
+        # Wrapper for the per-enclave secrets e2e test (#169). Same UDS-mode
+        # vsock plumbing as test-egress-vm; on top of that we stand up
+        # `enclavia-secrets-host` listening on ${PROXY_SOCKET}_5004 with the
+        # CBOR payload piped on stdin from $SECRETS_PAYLOAD_BASE64.
+        #
+        # SECRETS_SKIP_DAEMON=1 intentionally suppresses the daemon spawn so
+        # the harness can exercise the in-enclave failure-fast path
+        # (enclavia-secrets-init times out, init.sh's `set -e` fires before
+        # crun launches the workload).
+        #
+        # SECRETS_MODE=inject|empty is propagated to the workload via the
+        # nitro-enclave `append=` kernel command line (init.sh parses
+        # enclavia.secrets_mode=).
+        test-secrets-vm = pkgs.writeShellScriptBin "enclavia-test-secrets-vm" ''
+          set -euo pipefail
+
+          EIF_PATH="${test-enclave-secrets-debug}/image.eif"
+          MEMORY="''${MEMORY:-4G}"
+          CPUS="''${CPUS:-2}"
+
+          SECRETS_MODE="''${SECRETS_MODE:-inject}"
+          SECRETS_SKIP_DAEMON="''${SECRETS_SKIP_DAEMON:-0}"
+
+          GUEST_CID=4
+          SECRETS_VSOCK_PORT=5004
+
+          SOCK_DIR="$(${pkgs.coreutils}/bin/mktemp -d /tmp/enclave-secrets-test.XXXXXX)"
+          VHOST_SOCKET="''${SOCK_DIR}/vhost.sock"
+          PROXY_SOCKET="''${SOCK_DIR}/proxy.sock"
+
+          cleanup() {
+              echo ""
+              echo "secrets-test-vm: cleaning up..."
+              kill "''${HEARTBEAT_PID:-}" "''${VHOST_PID:-}" "''${SECRETS_PID:-}" 2>/dev/null || true
+              wait "''${HEARTBEAT_PID:-}" "''${VHOST_PID:-}" "''${SECRETS_PID:-}" 2>/dev/null || true
+              ${pkgs.coreutils}/bin/rm -rf "''${SOCK_DIR}"
+          }
+          trap cleanup EXIT
+
+          echo "secrets-test-vm: socket dir       = ''${SOCK_DIR}"
+          echo "secrets-test-vm: EIF              = ''${EIF_PATH}"
+          echo "secrets-test-vm: mode             = ''${SECRETS_MODE}"
+          echo "secrets-test-vm: skip-daemon      = ''${SECRETS_SKIP_DAEMON}"
+          echo "secrets-test-vm: memory = ''${MEMORY}, cpus = ''${CPUS}"
+
+          echo "secrets-test-vm: starting vhost-device-vsock (CID ''${GUEST_CID}, UDS mode)..."
+          vhost-device-vsock \
+              --vm "guest-cid=''${GUEST_CID},socket=''${VHOST_SOCKET},uds-path=''${PROXY_SOCKET}" &
+          VHOST_PID=$!
+
+          for i in $(${pkgs.coreutils}/bin/seq 1 50); do
+              [ -S "''${VHOST_SOCKET}" ] && break
+              ${pkgs.coreutils}/bin/sleep 0.1
+          done
+          if [ ! -S "''${VHOST_SOCKET}" ]; then
+              echo "secrets-test-vm: ERROR: vhost-device-vsock did not create socket" >&2
+              exit 1
+          fi
+
+          echo "secrets-test-vm: starting heartbeat responder..."
+          ${pkgs.python3}/bin/python3 ${heartbeatScript} --uds "''${PROXY_SOCKET}_9000" &
+          HEARTBEAT_PID=$!
+
+          for i in $(${pkgs.coreutils}/bin/seq 1 50); do
+              [ -S "''${PROXY_SOCKET}_9000" ] && break
+              ${pkgs.coreutils}/bin/sleep 0.1
+          done
+
+          if [ "''${SECRETS_SKIP_DAEMON}" = "1" ]; then
+              echo "secrets-test-vm: SECRETS_SKIP_DAEMON=1 — NOT spawning enclavia-secrets-host"
+              echo "secrets-test-vm:   expecting enclavia-secrets-init to fail fast in-enclave"
+          else
+              # Materialise the CBOR payload from $SECRETS_PAYLOAD_BASE64 (an
+              # empty value is valid: the daemon then serves an empty CBOR
+              # map after stdin EOF).
+              SECRETS_LISTEN_PATH="''${PROXY_SOCKET}_''${SECRETS_VSOCK_PORT}"
+              PAYLOAD_FILE="''${SOCK_DIR}/secrets.cbor"
+              if [ -n "''${SECRETS_PAYLOAD_BASE64:-}" ]; then
+                  ${pkgs.coreutils}/bin/printf '%s' "''${SECRETS_PAYLOAD_BASE64}" \
+                      | ${pkgs.coreutils}/bin/base64 -d > "''${PAYLOAD_FILE}"
+              else
+                  : > "''${PAYLOAD_FILE}"
+              fi
+
+              echo "secrets-test-vm: starting enclavia-secrets-host on ''${SECRETS_LISTEN_PATH} (payload=$(${pkgs.coreutils}/bin/stat -c %s "''${PAYLOAD_FILE}") bytes)..."
+              LISTEN_PATH="''${SECRETS_LISTEN_PATH}" \
+              RUST_LOG="''${RUST_LOG:-info}" \
+                  ${secretsHostBin} < "''${PAYLOAD_FILE}" &
+              SECRETS_PID=$!
+
+              for i in $(${pkgs.coreutils}/bin/seq 1 50); do
+                  [ -S "''${SECRETS_LISTEN_PATH}" ] && break
+                  ${pkgs.coreutils}/bin/sleep 0.1
+              done
+              if [ ! -S "''${SECRETS_LISTEN_PATH}" ]; then
+                  echo "secrets-test-vm: ERROR: secrets-host socket did not appear" >&2
+                  exit 1
+              fi
+          fi
+
+          echo ""
+          echo "  Watch the console output for 'secrets-test:' messages."
+          echo ""
+
+          APPEND="enclavia.secrets_mode=''${SECRETS_MODE}"
+          QEMU_ARGS=(
+              -M "nitro-enclave,vsock=c,id=enclavia-secrets-test,append=''${APPEND}"
+              -chardev "socket,id=c,path=''${VHOST_SOCKET}"
+              -kernel "''${EIF_PATH}"
+              -nographic
+              -m "''${MEMORY}"
+              -smp "''${CPUS}"
+          )
+
+          if [ -e /dev/kvm ]; then
+              QEMU_ARGS+=(--enable-kvm -cpu host)
+          else
+              QEMU_ARGS+=(-cpu max)
+          fi
+
+          qemu-system-x86_64 "''${QEMU_ARGS[@]}"
+        '';
+
         test-debug-vm = pkgs.writeShellScriptBin "enclavia-test-debug-vm" ''
           set -euo pipefail
 
@@ -632,7 +773,7 @@
       in
       {
         packages = {
-          inherit builder enclave enclave-debug enclave-storage enclave-storage-debug debug-vm test-bundle test-enclave test-enclave-debug test-debug-vm test-storage-bundle test-enclave-storage-debug test-enclave-storage-debug-no-luks test-storage-vm test-egress-bundle test-enclave-egress-debug test-egress-vm test-ws-bundle test-enclave-ws-debug;
+          inherit builder enclave enclave-debug enclave-storage enclave-storage-debug debug-vm test-bundle test-enclave test-enclave-debug test-debug-vm test-storage-bundle test-enclave-storage-debug test-enclave-storage-debug-no-luks test-storage-vm test-egress-bundle test-enclave-egress-debug test-egress-vm test-ws-bundle test-enclave-ws-debug test-secrets-bundle test-enclave-secrets-debug test-secrets-vm;
           default = builder;
         };
 
