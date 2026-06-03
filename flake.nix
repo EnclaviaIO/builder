@@ -222,12 +222,12 @@
         test-bundle = pkgs.callPackage ./nix/test-bundle.nix { inherit pkgs; };
 
         test-enclave = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
           ociBundlePath = test-bundle;
         };
 
         test-enclave-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
           ociBundlePath = test-bundle;
           debugMode = true;
         };
@@ -258,7 +258,7 @@
         test-egress-bundle = pkgs.callPackage ./nix/test-egress-bundle.nix { inherit pkgs; };
 
         test-enclave-egress-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
           ociBundlePath = test-egress-bundle;
           debugMode = true;
         };
@@ -282,7 +282,7 @@
         test-storage-bundle = pkgs.callPackage ./nix/test-storage-bundle.nix { inherit pkgs; };
 
         test-enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg;
           ociBundlePath = test-storage-bundle;
           debugMode = true;
           storageEnabled = true;
@@ -293,7 +293,7 @@
         # against raw btrfs writes. Used to isolate proxy throughput from
         # cryptsetup overhead on TCG.
         test-enclave-storage-debug-no-luks = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg;
           ociBundlePath = test-storage-bundle;
           debugMode = true;
           storageEnabled = true;
