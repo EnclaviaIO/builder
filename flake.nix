@@ -38,7 +38,7 @@
     # Override during local development with
     # `--override-input enclavia path:../enclavia`.
     enclavia = {
-      url = "github:EnclaviaIO/enclavia/bf26ec0b59092ff4f7ee62f164a99cc5e10dcd99";
+      url = "github:EnclaviaIO/enclavia/bf26ec0b5909529773ae9d2a1aa1cb9ea29669e5";
     };
   };
 
