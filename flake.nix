@@ -38,7 +38,11 @@
     # Override during local development with
     # `--override-input enclavia path:../enclavia`.
     enclavia = {
-      url = "github:EnclaviaIO/enclavia/bf26ec0b5909529773ae9d2a1aa1cb9ea29669e5";
+      # Pinned to the branch HEAD of EnclaviaIO/enclavia#26
+      # (feat/expose-chain-init-flake), which adds
+      # `enclavia-chain-init` as a flake package output. Re-bump
+      # to the post-squash master SHA once that PR merges.
+      url = "github:EnclaviaIO/enclavia/dc5d09f353dad854d6629b4735d0872a5bbe98c7";
     };
   };
 
@@ -103,6 +107,7 @@
         enclaviaCryptoPkg = enclavia.packages.${system}.enclavia-crypto;
         enclaviaEgressPkg = enclavia.packages.${system}.enclavia-egress;
         enclaviaSecretsInitPkg = enclavia.packages.${system}.enclavia-secrets-init;
+        enclaviaChainInitPkg = enclavia.packages.${system}.enclavia-chain-init;
         mockKmsPkg = enclavia.packages.${system}.mock-kms;
         nitroLib = nitro-util.lib.${system};
 
@@ -127,25 +132,25 @@
         };
 
         enclave = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
           ociBundlePath = oci-bundle;
         };
 
         enclave-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
           ociBundlePath = oci-bundle;
           debugMode = true;
         };
 
         enclave-storage = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
           ociBundlePath = oci-bundle;
           storageEnabled = true;
           customKernel = storageKernel;
         };
 
         enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
           ociBundlePath = oci-bundle;
           debugMode = true;
           storageEnabled = true;
@@ -227,7 +232,7 @@
         };
 
         test-enclave-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaChainInitPkg;
           ociBundlePath = test-bundle;
           debugMode = true;
         };

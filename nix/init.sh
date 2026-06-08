@@ -399,6 +399,21 @@ if [ -x /bin/enclavia-secrets-init ]; then
     /bin/enclavia-secrets-init /var/lib/oci/bundle
 fi
 
+# In-enclave boot-attestation submitter (#47 phase 3b). Dials
+# chain-host on vsock 5005, signs a genesis ChainLink with the NSM
+# attestation doc, and submits it. The launcher's wait-for-socket
+# loop guarantees chain-host is listening before the EIF boots, so
+# the dial should always succeed.
+#
+# Non-fatal: the boot link is best-effort. If chain-host is down or
+# rejects the link, we log a warning to the serial console and keep
+# going. The workload's identity is still bound by the PCRs in
+# `enclavia-config.json`; the chain is an additional audit signal,
+# not a precondition for execution.
+if [ -x /bin/enclavia-chain-init ]; then
+    /bin/enclavia-chain-init || echo "warning: enclavia-chain-init failed; chain link not emitted" >&2
+fi
+
 # Start the customer's container in the background using crun.
 # --no-pivot: use chroot instead of pivot_root (required on initramfs)
 /bin/crun run --no-pivot --bundle /var/lib/oci/bundle customer &
