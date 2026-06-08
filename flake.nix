@@ -42,7 +42,7 @@
       # (feat/expose-chain-init-flake), which adds
       # `enclavia-chain-init` as a flake package output. Re-bump
       # to the post-squash master SHA once that PR merges.
-      url = "github:EnclaviaIO/enclavia/dc5d09f353dad854d6629b4735d0872a5bbe98c7";
+      url = "github:EnclaviaIO/enclavia/b6bb06a0b2a8d072bd97270db44f6ac0f6a4f6e4";
     };
   };
 
