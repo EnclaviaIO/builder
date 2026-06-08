@@ -83,6 +83,19 @@ enum Cli {
         #[arg(long)]
         enclave_id: Option<String>,
 
+        /// Registry manifest digest of the Docker image being built. Stamped
+        /// into `enclavia-config.json` so the in-enclave chain-init helper
+        /// (#47, phase 3b) can populate `BootPayload::image_digest` when it
+        /// submits the boot attestation through the host-side chain-host
+        /// daemon. Optional so direct builder users (CI, manual debugging)
+        /// don't have to pass one; the backend always supplies it.
+        ///
+        /// Expected shape is `sha256:[0-9a-f]{64}` (what the registry
+        /// returns from a manifest GET). Light shape check at validate time
+        /// keeps an obviously-wrong value from making it into the EIF.
+        #[arg(long)]
+        image_digest: Option<String>,
+
         /// Path to the egress allowlist JSON (`{"version":1,"resolvers":[],
         /// "egress":[...]}`). When set, the file is copied into the OCI
         /// bundle as `egress.json`; `enclave.nix` then places it at
@@ -473,13 +486,38 @@ fn validate_control_pubkey(b64: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// Light shape check for the `--image-digest` flag (#47). The registry's
+/// manifest digest is the canonical `sha256:[0-9a-f]{64}` form; we accept
+/// only that prefix and the right hex length. Refusing anything else
+/// keeps a malformed digest from getting baked into the EIF where it
+/// would surface as a chain-validation failure later. We do not verify
+/// the digest matches the image content (that's the registry's job), and
+/// the in-enclave chain-init relays whatever the backend supplied here.
+fn validate_image_digest(s: &str) -> std::result::Result<(), String> {
+    let rest = s
+        .strip_prefix("sha256:")
+        .ok_or_else(|| format!("expected `sha256:<hex>` prefix, got `{s}`"))?;
+    if rest.len() != 64 {
+        return Err(format!(
+            "expected 64-hex-char digest after `sha256:`, got {} chars",
+            rest.len()
+        ));
+    }
+    if !rest.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
+        return Err("digest body must be lowercase hex (`0-9a-f`)".into());
+    }
+    Ok(())
+}
+
 /// Write the enclavia config into the bundle so enclave.nix picks it up.
+#[allow(clippy::too_many_arguments)]
 fn write_enclavia_config(
     bundle_dir: &Path,
     container_port: u16,
     storage: bool,
     control_pubkey: Option<&str>,
     enclave_id: Option<&str>,
+    image_digest: Option<&str>,
 ) -> Result<()> {
     let mut config = serde_json::json!({
         "listen_vsock_port": 5000,
@@ -510,6 +548,13 @@ fn write_enclavia_config(
         config["enclave_id"] = serde_json::Value::String(id.to_string());
     }
 
+    // image_digest is consumed by the in-enclave chain-init helper (#47).
+    // The field stays absent when the caller didn't pass one so older
+    // callers and the `cargo run -- build ...` dev loop keep working.
+    if let Some(digest) = image_digest {
+        config["image_digest"] = serde_json::Value::String(digest.to_string());
+    }
+
     let path = bundle_dir.join("enclavia-config.json");
     std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap())?;
     info!(
@@ -517,6 +562,7 @@ fn write_enclavia_config(
         storage,
         control_channel = control_pubkey.is_some(),
         has_enclave_id = enclave_id.is_some(),
+        has_image_digest = image_digest.is_some(),
         "wrote enclavia config"
     );
     Ok(())
@@ -533,6 +579,7 @@ async fn build(
     storage: bool,
     control_pubkey: Option<&str>,
     enclave_id: Option<&str>,
+    image_digest: Option<&str>,
     egress_allowlist: Option<&Path>,
 ) -> Result<BuildResult> {
     let tmp = tempfile::tempdir()?;
@@ -554,7 +601,14 @@ async fn build(
     patch_bundle_config(&bundle_dir)?;
 
     // 4. Write enclavia config into bundle
-    write_enclavia_config(&bundle_dir, container_port, storage, control_pubkey, enclave_id)?;
+    write_enclavia_config(
+        &bundle_dir,
+        container_port,
+        storage,
+        control_pubkey,
+        enclave_id,
+        image_digest,
+    )?;
 
     // 4b. If the caller supplied an egress allowlist, drop it into the
     // bundle at a fixed name. `enclave.nix` checks for this path and
@@ -611,6 +665,7 @@ async fn main() {
             storage,
             control_pubkey,
             enclave_id,
+            image_digest,
             egress_allowlist,
         } => {
             let creds = match (&registry_user, &registry_password) {
@@ -625,6 +680,13 @@ async fn main() {
                 }
             }
 
+            if let Some(ref d) = image_digest {
+                if let Err(e) = validate_image_digest(d) {
+                    error!(%e, "--image-digest rejected");
+                    std::process::exit(2);
+                }
+            }
+
             match build(
                 &image,
                 creds,
@@ -635,6 +697,7 @@ async fn main() {
                 storage,
                 control_pubkey.as_deref(),
                 enclave_id.as_deref(),
+                image_digest.as_deref(),
                 egress_allowlist.as_deref(),
             )
             .await
@@ -649,5 +712,44 @@ async fn main() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_digest_accepts_canonical_sha256() {
+        let d = format!("sha256:{}", "0".repeat(64));
+        assert!(validate_image_digest(&d).is_ok());
+        let d = format!("sha256:{}", "abcdef0123456789".repeat(4));
+        assert!(validate_image_digest(&d).is_ok());
+    }
+
+    #[test]
+    fn image_digest_rejects_missing_prefix() {
+        let d = "0".repeat(64);
+        assert!(validate_image_digest(&d).is_err());
+    }
+
+    #[test]
+    fn image_digest_rejects_wrong_length() {
+        let d = format!("sha256:{}", "0".repeat(63));
+        assert!(validate_image_digest(&d).is_err());
+        let d = format!("sha256:{}", "0".repeat(65));
+        assert!(validate_image_digest(&d).is_err());
+    }
+
+    #[test]
+    fn image_digest_rejects_uppercase_hex() {
+        let d = format!("sha256:{}", "A".repeat(64));
+        assert!(validate_image_digest(&d).is_err());
+    }
+
+    #[test]
+    fn image_digest_rejects_non_hex() {
+        let d = format!("sha256:{}", "g".repeat(64));
+        assert!(validate_image_digest(&d).is_err());
     }
 }
