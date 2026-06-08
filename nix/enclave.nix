@@ -12,6 +12,10 @@
   # one-off test EIFs callPackage this file with a hand-built attrset;
   # the flake's regular invocations always supply it.
   enclaviaSecretsInitPkg ? null,
+  # In-enclave boot-attestation submitter (#47 phase 3b). Optional for
+  # the same reason as enclaviaSecretsInitPkg: hand-built test EIFs
+  # may skip it, but every real-enclave variant passes it in.
+  enclaviaChainInitPkg ? null,
   storageEnabled ? false,
   customKernel ? null,
   # Diagnostic: skip LUKS and mount raw btrfs on the NBD device directly.
@@ -97,6 +101,16 @@ let
     # backend only starts `secrets-host` when the enclave has secrets
     # configured), so it is always safe to invoke.
     cp ${enclaviaSecretsInitPkg}/bin/enclavia-secrets-init $out/bin/
+    '' else ""}
+
+    ${if enclaviaChainInitPkg != null then ''
+    # In-enclave boot-attestation submitter (#47 phase 3b). init.sh
+    # invokes it between secrets-init and `exec enclavia-server`;
+    # it dials chain-host on vsock 5005, signs a boot link with the
+    # enclave's NSM attestation doc, and submits it. Failures are
+    # non-fatal: the boot link is best-effort and must not block
+    # the workload from starting.
+    cp ${enclaviaChainInitPkg}/bin/enclavia-chain-init $out/bin/
     '' else ""}
 
     # Minimal busybox for networking setup (ip link set lo up)

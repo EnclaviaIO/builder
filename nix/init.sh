@@ -399,6 +399,31 @@ if [ -x /bin/enclavia-secrets-init ]; then
     /bin/enclavia-secrets-init /var/lib/oci/bundle
 fi
 
+# In-enclave boot-attestation submitter (#47 phase 3b). Dials
+# chain-host on vsock 5005, builds a genesis ChainLink with the NSM
+# attestation doc, and submits it. The launcher's wait-for-socket
+# loop guarantees chain-host is listening before the EIF boots, so
+# the dial should always succeed.
+#
+# Two cases:
+#   * Binary absent: this EIF variant was built without chain-init
+#     (e.g. a test variant). Skip silently. The corresponding
+#     enclavia-crates path also does not stand up chain-host, so
+#     there is nothing on the other side to talk to.
+#   * Binary present: failure is fatal. Recording the genesis boot
+#     link is the whole point of running this binary, and silently
+#     swallowing the failure would leave the public chain
+#     permanently missing its first entry, with no way for a client
+#     walking it later to know whether the absence is "did not
+#     happen yet" or "was lost". `set -e` at the top of this script
+#     already promotes any non-zero exit here to a boot abort; we
+#     prefix the line with the explicit error message so the
+#     serial log carries a clear cause.
+if [ -x /bin/enclavia-chain-init ]; then
+    /bin/enclavia-chain-init \
+        || (echo "ERROR: enclavia-chain-init failed; aborting boot" >&2; exit 1)
+fi
+
 # Start the customer's container in the background using crun.
 # --no-pivot: use chroot instead of pivot_root (required on initramfs)
 /bin/crun run --no-pivot --bundle /var/lib/oci/bundle customer &
