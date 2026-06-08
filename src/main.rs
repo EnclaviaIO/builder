@@ -65,10 +65,12 @@ enum Cli {
         #[arg(long)]
         storage: bool,
 
-        /// Base64-encoded Ed25519 public key (32 raw bytes) for the management
-        /// control channel. When set, enclavia-server will accept signed
-        /// `Control` commands from the backend; when absent the channel is
-        /// disabled. Required for the upgrade flow.
+        /// Base64-encoded ECDSA P-256 public key in uncompressed SEC1
+        /// form (65 raw bytes: `0x04 || X(32) || Y(32)`, big-endian) for
+        /// the management control channel (#47). When set, the
+        /// in-enclave server will accept signed `Control` commands from
+        /// the backend; when absent the channel is disabled. Required
+        /// for the upgrade flow.
         #[arg(long)]
         control_pubkey: Option<String>,
 
@@ -445,18 +447,27 @@ fn copy_artifacts(result_dir: &Path, output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Validate that a base64-encoded Ed25519 public key decodes to exactly
-/// 32 bytes. We don't verify it's a valid curve point — enclavia-server
-/// re-parses it via ed25519-dalek at boot, which catches that.
+/// Validate that a base64-encoded ECDSA P-256 public key decodes to
+/// exactly 65 bytes with the uncompressed SEC1 prefix `0x04` (#47). We
+/// don't verify it's a valid curve point — `enclavia-server` re-parses
+/// it via `p256::ecdsa::VerifyingKey::from_sec1_bytes` at boot, which
+/// catches that. The cheap shape-only check keeps a malformed pubkey
+/// from making it into the EIF in the first place.
 fn validate_control_pubkey(b64: &str) -> std::result::Result<(), String> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.as_bytes())
         .map_err(|e| format!("invalid base64: {e}"))?;
-    if bytes.len() != 32 {
+    if bytes.len() != 65 {
         return Err(format!(
-            "expected 32 bytes (raw Ed25519 public key), got {}",
+            "expected 65 bytes (uncompressed SEC1 ECDSA P-256 public key), got {}",
             bytes.len()
+        ));
+    }
+    if bytes[0] != 0x04 {
+        return Err(format!(
+            "expected uncompressed SEC1 prefix 0x04, got 0x{:02x}",
+            bytes[0]
         ));
     }
     Ok(())
