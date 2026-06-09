@@ -107,9 +107,11 @@ let
     # In-enclave boot-attestation submitter (#47 phase 3b). init.sh
     # invokes it between secrets-init and `exec enclavia-server`;
     # it dials chain-host on vsock 5005, signs a boot link with the
-    # enclave's NSM attestation doc, and submits it. Failures are
-    # non-fatal: the boot link is best-effort and must not block
-    # the workload from starting.
+    # enclave's NSM attestation doc, and submits it. When the binary
+    # is baked in, failure is fatal: the genesis boot link is the only
+    # authoritative record that the boot happened, so init.sh aborts
+    # the boot (via `set -e`) rather than start the workload without
+    # it. See the comment block above the invocation in init.sh.
     cp ${enclaviaChainInitPkg}/bin/enclavia-chain-init $out/bin/
     '' else ""}
 
