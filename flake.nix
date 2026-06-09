@@ -231,8 +231,21 @@
           ociBundlePath = test-bundle;
         };
 
+        # Note: deliberately does NOT pass `enclaviaChainInitPkg`. The
+        # router-path e2e (`tests/run_e2e_router.sh` in
+        # enclavia-crates) boots this EIF without standing up
+        # `chain-host` on the parent, so a baked-in chain-init would
+        # dial vsock 5005, hit its 30s connect timeout, exit 1, and
+        # `set -e` in init.sh would abort the boot. Reboot loop, CI
+        # runner wedges until the workflow timeout kills it (~51 min
+        # observed). Sibling test enclaves (test-enclave-egress-debug,
+        # test-enclave-storage-debug, test-enclave-secrets-debug)
+        # already follow this pattern — they only inherit the packages
+        # the scenario actually needs. Chain submission is exercised
+        # via the production launcher in enclavia-crates, not via this
+        # test wrapper.
         test-enclave-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaChainInitPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
           ociBundlePath = test-bundle;
           debugMode = true;
         };
