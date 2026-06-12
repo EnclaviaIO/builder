@@ -288,14 +288,19 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
     # Anti-rollback wiring (enclavia#208): export SYNCHRONIZER_ENABLED=1
     # when the MEASURED config says so (`synchronizer.enabled == true`,
     # set by the builder's --synchronizer-enabled). jq scopes the lookup
-    # precisely to that key, unlike the line-grep above for STORAGE which
+    # precisely to that key, unlike the old line-grep for STORAGE which
     # would otherwise also fire on a synchronizer `enabled`. nbd-client
     # then reads synchronizer.expected_pcrs to authenticate the oracle
     # (and fail-stops without). False/absent leaves the var unset and
     # nbd-client runs exactly as before.
-    SYNC_ENV=""
+    #
+    # Plain `export` rather than an `env VAR=... cmd` prefix: the rootfs
+    # busybox does not link an `env` applet, and a literal KEY=value
+    # prefix cannot be carried in a shell variable. Exporting into the
+    # init environment is safe: the OCI workload's process.env is built
+    # explicitly and never inherits from init.
     if [ -f "$CONFIG" ] && [ "$(/bin/jq -r '.synchronizer.enabled // false' "$CONFIG" 2>/dev/null)" = "true" ]; then
-        SYNC_ENV="SYNCHRONIZER_ENABLED=1"
+        export SYNCHRONIZER_ENABLED=1
         echo "init: synchronizer anti-rollback wiring ENABLED"
     fi
 
@@ -303,9 +308,9 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
     # In skip-LUKS diagnostic mode, the proxy sees raw btrfs writes (no dm-crypt
     # offset translation), so superblock offsets line up at LUKS_DATA_OFFSET=0.
     if [ "$SKIP_LUKS" = "true" ]; then
-        env $SYNC_ENV LUKS_DATA_OFFSET=0 /bin/enclavia-nbd-client &
+        LUKS_DATA_OFFSET=0 /bin/enclavia-nbd-client &
     else
-        env $SYNC_ENV /bin/enclavia-nbd-client &
+        /bin/enclavia-nbd-client &
     fi
 
     # Wait for nbd-client to configure the device (non-zero size).
