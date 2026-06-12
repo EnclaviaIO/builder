@@ -103,10 +103,40 @@ enum Cli {
         /// baked in: the in-enclave daemon defaults to deny-all.
         #[arg(long)]
         egress_allowlist: Option<PathBuf>,
+
+        /// Synchronizer trust anchors for the anti-rollback wiring
+        /// (enclavia#208). The value is either a path to a JSON file or
+        /// inline JSON (detected by a leading `{` or `[`): one
+        /// `{"PCR0","PCR1","PCR2"}` hex triple (the shape of pcr.json,
+        /// e.g. from the synchronizer image's own build) or a list of
+        /// such triples. When set, a `synchronizer` section with
+        /// `expected_pcrs` and `debug_attestation` (mirroring --debug)
+        /// is stamped into `enclavia-config.json`, which lands at
+        /// `/etc/enclavia/config.json` inside the MEASURED rootfs; the
+        /// in-enclave nbd-client reads it to authenticate the
+        /// synchronizer oracle before serving storage. When unset, no
+        /// section is written and enclaves keep today's behavior
+        /// (nbd-client's wiring is opted in by --synchronizer-enabled,
+        /// below, and then fail-stops on a missing section). The backend
+        /// supplies this at build time; the values MUST come from
+        /// build-time config, never from the running host.
+        #[arg(long)]
+        synchronizer_pcrs: Option<String>,
+
+        /// Turn ON the in-enclave anti-rollback wiring (enclavia#208):
+        /// stamp `synchronizer.enabled = true` into the measured config,
+        /// which the EIF init reads to export `SYNCHRONIZER_ENABLED=1`
+        /// for the nbd-client. REQUIRES --synchronizer-pcrs (an enabled
+        /// wiring with no expected oracle PCRs would fail-stop the
+        /// enclave at every boot). Without this flag the wiring stays
+        /// off even if anchors are baked in, so an enclave can ship the
+        /// anchors disabled and be flipped on by a later rebuild.
+        #[arg(long)]
+        synchronizer_enabled: bool,
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PcrValues {
     #[serde(rename = "PCR0")]
     pcr0: String,
@@ -509,15 +539,86 @@ fn validate_image_digest(s: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// Shape check for one PCR hex value inside `--synchronizer-pcrs`. Both
+/// real Nitro measurements and the deterministic FakeAttestor used in
+/// QEMU dev clusters are SHA-384-sized (48 bytes), so a valid value is
+/// exactly 96 lowercase hex chars. The in-enclave nbd-client
+/// hex-decodes these at boot and FAIL-STOPS on anything malformed, so
+/// rejecting bad values here keeps a broken trust anchor from getting
+/// measured into an EIF that can then never serve storage.
+fn validate_pcr_hex(label: &str, s: &str) -> std::result::Result<(), String> {
+    if s.len() != 96 {
+        return Err(format!(
+            "{label}: expected 96 hex chars (48-byte SHA-384 measurement), got {}",
+            s.len()
+        ));
+    }
+    if !s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
+        return Err(format!("{label}: must be lowercase hex (`0-9a-f`)"));
+    }
+    Ok(())
+}
+
+/// Parse and validate the `--synchronizer-pcrs` flag (enclavia#208).
+///
+/// The argument is inline JSON when it starts with `{` or `[` (after
+/// trimming), otherwise it is treated as a path to a JSON file. The
+/// JSON itself is either a single `{"PCR0","PCR1","PCR2"}` hex triple
+/// (the builder's own pcr.json shape, normalized to a one-element
+/// list) or a non-empty array of such triples (several oracle images
+/// accepted at once, e.g. across a synchronizer upgrade window).
+///
+/// The returned list is exactly what gets serialized under
+/// `synchronizer.expected_pcrs` in `enclavia-config.json`; the key
+/// names (`PCR0`/`PCR1`/`PCR2`) match the `PcrsHex` wire shape the
+/// in-enclave nbd-client deserializes.
+fn parse_synchronizer_pcrs(arg: &str) -> std::result::Result<Vec<PcrValues>, String> {
+    let trimmed = arg.trim();
+    let json = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        trimmed.to_string()
+    } else {
+        std::fs::read_to_string(trimmed)
+            .map_err(|e| format!("cannot read synchronizer PCR file `{trimmed}`: {e}"))?
+    };
+
+    let value: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| format!("invalid JSON: {e}"))?;
+    let triples: Vec<PcrValues> = if value.is_array() {
+        serde_json::from_value(value)
+            .map_err(|e| format!("expected a list of {{PCR0,PCR1,PCR2}} triples: {e}"))?
+    } else {
+        let one: PcrValues = serde_json::from_value(value)
+            .map_err(|e| format!("expected a {{PCR0,PCR1,PCR2}} triple: {e}"))?;
+        vec![one]
+    };
+
+    if triples.is_empty() {
+        return Err(
+            "expected at least one PCR triple; an empty list would make the in-enclave \
+             nbd-client fail-stop at boot (unverifiable oracle)"
+                .into(),
+        );
+    }
+    for (i, t) in triples.iter().enumerate() {
+        validate_pcr_hex(&format!("expected_pcrs[{i}].PCR0"), &t.pcr0)?;
+        validate_pcr_hex(&format!("expected_pcrs[{i}].PCR1"), &t.pcr1)?;
+        validate_pcr_hex(&format!("expected_pcrs[{i}].PCR2"), &t.pcr2)?;
+    }
+    Ok(triples)
+}
+
 /// Write the enclavia config into the bundle so enclave.nix picks it up.
 #[allow(clippy::too_many_arguments)]
 fn write_enclavia_config(
     bundle_dir: &Path,
     container_port: u16,
+    debug: bool,
     storage: bool,
     control_pubkey: Option<&str>,
     enclave_id: Option<&str>,
     image_digest: Option<&str>,
+    synchronizer_pcrs: Option<&[PcrValues]>,
+    synchronizer_enabled: bool,
 ) -> Result<()> {
     let mut config = serde_json::json!({
         "listen_vsock_port": 5000,
@@ -555,6 +656,24 @@ fn write_enclavia_config(
         config["image_digest"] = serde_json::Value::String(digest.to_string());
     }
 
+    // Synchronizer trust anchors (enclavia#208). `expected_pcrs` is the
+    // set of oracle measurements the in-enclave nbd-client will accept
+    // when the anti-rollback wiring is enabled; `debug_attestation`
+    // mirrors the build mode (QEMU's self-signing NSM in --debug, the
+    // full AWS Nitro CA chain otherwise). Both are part of the trust
+    // decision, which is exactly why they live in this file: it ends up
+    // at /etc/enclavia/config.json inside the measured rootfs, so the
+    // host can't substitute its own oracle. Absent when the caller
+    // didn't pass --synchronizer-pcrs (enclaves without synchronizer
+    // pinning keep today's config byte-for-byte).
+    if let Some(pcrs) = synchronizer_pcrs {
+        config["synchronizer"] = serde_json::json!({
+            "enabled": synchronizer_enabled,
+            "expected_pcrs": pcrs,
+            "debug_attestation": debug,
+        });
+    }
+
     let path = bundle_dir.join("enclavia-config.json");
     std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap())?;
     info!(
@@ -563,6 +682,8 @@ fn write_enclavia_config(
         control_channel = control_pubkey.is_some(),
         has_enclave_id = enclave_id.is_some(),
         has_image_digest = image_digest.is_some(),
+        synchronizer_pcr_sets = synchronizer_pcrs.map(<[_]>::len).unwrap_or(0),
+        synchronizer_enabled,
         "wrote enclavia config"
     );
     Ok(())
@@ -581,6 +702,8 @@ async fn build(
     enclave_id: Option<&str>,
     image_digest: Option<&str>,
     egress_allowlist: Option<&Path>,
+    synchronizer_pcrs: Option<&[PcrValues]>,
+    synchronizer_enabled: bool,
 ) -> Result<BuildResult> {
     let tmp = tempfile::tempdir()?;
     let tmp_path = tmp.path();
@@ -604,10 +727,13 @@ async fn build(
     write_enclavia_config(
         &bundle_dir,
         container_port,
+        debug,
         storage,
         control_pubkey,
         enclave_id,
         image_digest,
+        synchronizer_pcrs,
+        synchronizer_enabled,
     )?;
 
     // 4b. If the caller supplied an egress allowlist, drop it into the
@@ -667,6 +793,8 @@ async fn main() {
             enclave_id,
             image_digest,
             egress_allowlist,
+            synchronizer_pcrs,
+            synchronizer_enabled,
         } => {
             let creds = match (&registry_user, &registry_password) {
                 (Some(u), Some(p)) => Some((u.as_str(), p.as_str())),
@@ -687,6 +815,28 @@ async fn main() {
                 }
             }
 
+            let synchronizer_pcrs = match synchronizer_pcrs.as_deref() {
+                Some(arg) => match parse_synchronizer_pcrs(arg) {
+                    Ok(triples) => Some(triples),
+                    Err(e) => {
+                        error!(%e, "--synchronizer-pcrs rejected");
+                        std::process::exit(2);
+                    }
+                },
+                None => None,
+            };
+
+            // Enabling the wiring without expected oracle PCRs would
+            // make the in-enclave nbd-client fail-stop at every boot
+            // (unverifiable oracle), so refuse the combination here.
+            if synchronizer_enabled && synchronizer_pcrs.is_none() {
+                error!(
+                    "--synchronizer-enabled requires --synchronizer-pcrs (the in-enclave \
+                     nbd-client fail-stops at boot with no expected oracle PCRs)"
+                );
+                std::process::exit(2);
+            }
+
             match build(
                 &image,
                 creds,
@@ -699,6 +849,8 @@ async fn main() {
                 enclave_id.as_deref(),
                 image_digest.as_deref(),
                 egress_allowlist.as_deref(),
+                synchronizer_pcrs.as_deref(),
+                synchronizer_enabled,
             )
             .await
             {
@@ -751,5 +903,169 @@ mod tests {
     fn image_digest_rejects_non_hex() {
         let d = format!("sha256:{}", "g".repeat(64));
         assert!(validate_image_digest(&d).is_err());
+    }
+
+    // --- synchronizer trust anchors (enclavia#208) ----------------------
+
+    fn triple(seed: char) -> PcrValues {
+        PcrValues {
+            pcr0: seed.to_string().repeat(96),
+            pcr1: "1".repeat(96),
+            pcr2: "2".repeat(96),
+        }
+    }
+
+    fn triple_json(seed: char) -> String {
+        serde_json::to_string(&triple(seed)).unwrap()
+    }
+
+    #[test]
+    fn pcr_hex_accepts_sha384_lowercase() {
+        assert!(validate_pcr_hex("PCR0", &"a".repeat(96)).is_ok());
+        assert!(validate_pcr_hex("PCR0", &"0123456789abcdef".repeat(6)).is_ok());
+    }
+
+    #[test]
+    fn pcr_hex_rejects_wrong_length_case_and_non_hex() {
+        assert!(validate_pcr_hex("PCR0", &"a".repeat(95)).is_err());
+        assert!(validate_pcr_hex("PCR0", &"a".repeat(97)).is_err());
+        assert!(validate_pcr_hex("PCR0", "").is_err());
+        assert!(validate_pcr_hex("PCR0", &"A".repeat(96)).is_err());
+        assert!(validate_pcr_hex("PCR0", &"g".repeat(96)).is_err());
+    }
+
+    #[test]
+    fn synchronizer_pcrs_inline_single_triple_normalizes_to_list() {
+        let parsed = parse_synchronizer_pcrs(&triple_json('a')).unwrap();
+        assert_eq!(parsed, vec![triple('a')]);
+    }
+
+    #[test]
+    fn synchronizer_pcrs_inline_list() {
+        let json = format!("[{},{}]", triple_json('a'), triple_json('b'));
+        let parsed = parse_synchronizer_pcrs(&json).unwrap();
+        assert_eq!(parsed, vec![triple('a'), triple('b')]);
+    }
+
+    #[test]
+    fn synchronizer_pcrs_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pcr.json");
+        std::fs::write(&path, triple_json('c')).unwrap();
+        let parsed = parse_synchronizer_pcrs(path.to_str().unwrap()).unwrap();
+        assert_eq!(parsed, vec![triple('c')]);
+    }
+
+    #[test]
+    fn synchronizer_pcrs_missing_file_is_rejected() {
+        assert!(parse_synchronizer_pcrs("/nonexistent/pcr.json").is_err());
+    }
+
+    #[test]
+    fn synchronizer_pcrs_empty_list_is_rejected() {
+        // An empty expected_pcrs list would make the in-enclave
+        // nbd-client fail-stop at boot; refuse it at build time.
+        assert!(parse_synchronizer_pcrs("[]").is_err());
+    }
+
+    #[test]
+    fn synchronizer_pcrs_invalid_json_and_shapes_are_rejected() {
+        assert!(parse_synchronizer_pcrs("{not json").is_err());
+        assert!(parse_synchronizer_pcrs(r#"{"PCR0": "aa"}"#).is_err());
+        // Valid shape, bad hex.
+        let bad = format!(
+            r#"{{"PCR0": "{}", "PCR1": "{}", "PCR2": "{}"}}"#,
+            "z".repeat(96),
+            "1".repeat(96),
+            "2".repeat(96)
+        );
+        assert!(parse_synchronizer_pcrs(&bad).is_err());
+    }
+
+    // --- enclavia-config.json generation ---------------------------------
+
+    fn written_config(
+        debug: bool,
+        storage: bool,
+        synchronizer_pcrs: Option<&[PcrValues]>,
+        synchronizer_enabled: bool,
+    ) -> serde_json::Value {
+        let dir = tempfile::tempdir().unwrap();
+        write_enclavia_config(
+            dir.path(),
+            8080,
+            debug,
+            storage,
+            None,
+            Some("enclave-uuid"),
+            None,
+            synchronizer_pcrs,
+            synchronizer_enabled,
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(dir.path().join("enclavia-config.json")).unwrap();
+        serde_json::from_str(&content).unwrap()
+    }
+
+    #[test]
+    fn config_has_no_synchronizer_section_when_flag_absent() {
+        // Enclaves built without --synchronizer-pcrs must keep today's
+        // config shape (and therefore today's PCRs for unchanged inputs).
+        let config = written_config(false, true, None, false);
+        assert!(config.get("synchronizer").is_none());
+        assert_eq!(config["storage"]["enabled"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn config_synchronizer_section_matches_nbd_client_contract() {
+        // The exact key names nbd-client's RawSynchronizerSection /
+        // PcrsHex deserialize: synchronizer.expected_pcrs[].PCR{0,1,2}
+        // plus synchronizer.debug_attestation.
+        let triples = vec![triple('a'), triple('b')];
+        let config = written_config(false, true, Some(&triples), false);
+        let section = &config["synchronizer"];
+        assert_eq!(section["debug_attestation"], serde_json::json!(false));
+        let expected = section["expected_pcrs"].as_array().unwrap();
+        assert_eq!(expected.len(), 2);
+        assert_eq!(expected[0]["PCR0"], serde_json::json!("a".repeat(96)));
+        assert_eq!(expected[0]["PCR1"], serde_json::json!("1".repeat(96)));
+        assert_eq!(expected[0]["PCR2"], serde_json::json!("2".repeat(96)));
+        assert_eq!(expected[1]["PCR0"], serde_json::json!("b".repeat(96)));
+        // Round-trip through the same serde shape nbd-client uses.
+        let round: Vec<PcrValues> =
+            serde_json::from_value(section["expected_pcrs"].clone()).unwrap();
+        assert_eq!(round, triples);
+    }
+
+    #[test]
+    fn config_debug_attestation_mirrors_debug_flag() {
+        let triples = vec![triple('a')];
+        let config = written_config(true, true, Some(&triples), false);
+        assert_eq!(
+            config["synchronizer"]["debug_attestation"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn config_base_fields_survive_synchronizer_section() {
+        let triples = vec![triple('a')];
+        let config = written_config(false, false, Some(&triples), false);
+        assert_eq!(config["listen_vsock_port"], serde_json::json!(5000));
+        assert_eq!(config["enclave_id"], serde_json::json!("enclave-uuid"));
+        assert!(config.get("storage").is_none());
+    }
+
+    #[test]
+    fn config_synchronizer_enabled_flag_is_written() {
+        let triples = vec![triple('a')];
+        // Anchors baked but wiring OFF: enabled defaults false, so the
+        // EIF init does not export SYNCHRONIZER_ENABLED.
+        let off = written_config(false, true, Some(&triples), false);
+        assert_eq!(off["synchronizer"]["enabled"], serde_json::json!(false));
+        // Wiring ON: init reads `synchronizer.enabled == true` and
+        // exports SYNCHRONIZER_ENABLED=1 for nbd-client.
+        let on = written_config(false, true, Some(&triples), true);
+        assert_eq!(on["synchronizer"]["enabled"], serde_json::json!(true));
     }
 }

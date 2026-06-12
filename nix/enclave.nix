@@ -178,8 +178,31 @@ let
     cp ${initScript} $out/bin/enclave-init
     chmod +x $out/bin/enclave-init
 
-    # Enclavia config
+    # Enclavia config. This file carries the enclave's trust anchors
+    # (#47 control_public_key, enclavia#208 synchronizer.expected_pcrs +
+    # debug_attestation), which are only worth anything because they sit
+    # INSIDE the measured rootfs: the rootfs is hashed into the EIF and
+    # shows up in the PCRs, so the host can't substitute its own values
+    # at runtime. Assert at build time that the copy actually landed,
+    # is valid JSON, and that any synchronizer section carries a
+    # non-empty expected_pcrs list (an empty one makes the in-enclave
+    # nbd-client fail-stop at boot, so catch it before it's measured
+    # into an EIF).
     cp ${enclaviaConfig} $out/etc/enclavia/config.json
+    if ! test -s $out/etc/enclavia/config.json; then
+      echo "enclave-rootfs: /etc/enclavia/config.json is missing or empty in the measured rootfs" >&2
+      exit 1
+    fi
+    if ! ${pkgs.pkgsStatic.jq}/bin/jq -e '
+      type == "object" and
+      (if has("synchronizer") then
+        (.synchronizer.expected_pcrs | type == "array" and length > 0)
+      else true end)
+    ' $out/etc/enclavia/config.json > /dev/null; then
+      echo "enclave-rootfs: /etc/enclavia/config.json failed the trust-anchor sanity check" >&2
+      echo "(must be a JSON object; a synchronizer section must carry a non-empty expected_pcrs array)" >&2
+      exit 1
+    fi
 
     ${if hasEgressAllowlist then ''
     # Egress allowlist (#138). The in-enclave daemon reads this at boot;

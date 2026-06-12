@@ -40,9 +40,12 @@ Flags (see `src/main.rs` for the source of truth):
 | `--container-port` | Port the customer's container listens on inside the enclave (default `8080`). |
 | `--debug` | Build for debug mode (QEMU with patched init using CID 2). See [docs/debug-mode.md](docs/debug-mode.md). |
 | `--storage` | Build the storage-capable variant (LUKS + btrfs over NBD over vsock). Pulls in a custom kernel + `enclavia-crypto`. |
-| `--control-pubkey` | Base64-encoded Ed25519 public key (32 raw bytes) for the management control channel. |
+| `--control-pubkey` | Base64-encoded ECDSA P-256 public key (65 raw bytes, uncompressed SEC1) for the management control channel. |
 | `--enclave-id` | Per-enclave identifier stamped into `enclavia-config.json`, so two enclaves built from identical inputs still get distinct PCRs. |
+| `--image-digest` | Registry manifest digest (`sha256:<hex>`) of the image being built, stamped into `enclavia-config.json` for the in-enclave chain-init helper. |
 | `--egress-allowlist` | Path to the egress allowlist JSON. Baked into the rootfs at `/etc/enclavia/egress.json`; absent means deny-all. |
+| `--synchronizer-pcrs` | Synchronizer trust anchors for the storage anti-rollback wiring: a pcr.json path or inline JSON carrying one or more `{PCR0,PCR1,PCR2}` hex triples. Written into `enclavia-config.json` as `synchronizer.expected_pcrs` together with `debug_attestation` (mirrors `--debug`); when absent no `synchronizer` section is written. |
+| `--synchronizer-enabled` | Turn the anti-rollback wiring ON: writes `synchronizer.enabled = true`, which the EIF init reads to export `SYNCHRONIZER_ENABLED=1` for the in-enclave nbd-client. Requires `--synchronizer-pcrs` (an enabled wiring with no expected oracle PCRs fail-stops at boot). Omit to bake the anchors disabled (flip on with a later rebuild). |
 
 ## What it produces
 
