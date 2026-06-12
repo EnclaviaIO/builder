@@ -326,7 +326,14 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
 
     read -r size < /sys/block/nbd0/size 2>/dev/null
     if [ -z "$size" ] || ! [ "$size" -gt 0 ] 2>/dev/null; then
-        echo "WARNING: /dev/nbd0 not configured (size=0), storage unavailable" >&2
+        # Storage is enabled but the device never came up (host daemon
+        # missing, or nbd-client fail-stopped, e.g. the synchronizer's
+        # anti-rollback boot verify refused to serve). Booting the
+        # workload anyway would hand it an empty tmpfs /data and let it
+        # silently run with fresh state, so abort the boot instead and
+        # let the parent see the enclave as dead.
+        echo "ERROR: /dev/nbd0 not configured (size=0); storage enabled but unavailable, aborting boot" >&2
+        exit 1
     elif [ "$SKIP_LUKS" = "true" ]; then
         # Diagnostic path: skip LUKS entirely. Format btrfs directly on the
         # raw NBD device and mount it. Used to isolate the proxy's behaviour
