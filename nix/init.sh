@@ -266,22 +266,16 @@ ROOTFS="/var/lib/oci/bundle/rootfs"
 /bin/mount -t tmpfs tmpfs "$ROOTFS/tmp" 2>/dev/null || true
 
 # --- Optional storage setup ---
-# Parse storage.enabled / storage.skip_luks from config using shell builtins.
-# `builtins.toJSON` in Nix produces a single-line JSON, so case-in-while only
-# fires the first matching arm. Use independent `if` checks instead.
+# Parse storage.enabled / storage.skip_luks with jq, scoped to the
+# `storage` section. The previous line-grep matched `"enabled": true`
+# from ANY section, so the synchronizer section's `enabled` key (below)
+# would have falsely switched storage on for storage-less enclaves; jq
+# keys the lookup to exactly `.storage.*`.
 STORAGE_ENABLED=false
 SKIP_LUKS=false
 if [ -f "$CONFIG" ]; then
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            *'"enabled":true'*) STORAGE_ENABLED=true ;;
-            *'"enabled": true'*) STORAGE_ENABLED=true ;;
-        esac
-        case "$line" in
-            *'"skip_luks":true'*) SKIP_LUKS=true ;;
-            *'"skip_luks": true'*) SKIP_LUKS=true ;;
-        esac
-    done < "$CONFIG"
+    STORAGE_ENABLED="$(/bin/jq -r '.storage.enabled // false' "$CONFIG" 2>/dev/null || echo false)"
+    SKIP_LUKS="$(/bin/jq -r '.storage.skip_luks // false' "$CONFIG" 2>/dev/null || echo false)"
 fi
 
 if [ "$STORAGE_ENABLED" = "true" ]; then
