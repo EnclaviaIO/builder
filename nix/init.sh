@@ -291,13 +291,27 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
     # Mount sysfs so we can check /sys/block/nbd0/size
     /bin/mount -t sysfs sysfs /sys 2>/dev/null || true
 
+    # Anti-rollback wiring (enclavia#208): export SYNCHRONIZER_ENABLED=1
+    # when the MEASURED config says so (`synchronizer.enabled == true`,
+    # set by the builder's --synchronizer-enabled). jq scopes the lookup
+    # precisely to that key, unlike the line-grep above for STORAGE which
+    # would otherwise also fire on a synchronizer `enabled`. nbd-client
+    # then reads synchronizer.expected_pcrs to authenticate the oracle
+    # (and fail-stops without). False/absent leaves the var unset and
+    # nbd-client runs exactly as before.
+    SYNC_ENV=""
+    if [ -f "$CONFIG" ] && [ "$(/bin/jq -r '.synchronizer.enabled // false' "$CONFIG" 2>/dev/null)" = "true" ]; then
+        SYNC_ENV="SYNCHRONIZER_ENABLED=1"
+        echo "init: synchronizer anti-rollback wiring ENABLED"
+    fi
+
     # Start NBD client — connects to host via vsock CID 2:5001, sets up /dev/nbd0.
     # In skip-LUKS diagnostic mode, the proxy sees raw btrfs writes (no dm-crypt
     # offset translation), so superblock offsets line up at LUKS_DATA_OFFSET=0.
     if [ "$SKIP_LUKS" = "true" ]; then
-        LUKS_DATA_OFFSET=0 /bin/enclavia-nbd-client &
+        env $SYNC_ENV LUKS_DATA_OFFSET=0 /bin/enclavia-nbd-client &
     else
-        /bin/enclavia-nbd-client &
+        env $SYNC_ENV /bin/enclavia-nbd-client &
     fi
 
     # Wait for nbd-client to configure the device (non-zero size).

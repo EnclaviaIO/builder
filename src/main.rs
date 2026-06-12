@@ -116,13 +116,23 @@ enum Cli {
         /// in-enclave nbd-client reads it to authenticate the
         /// synchronizer oracle before serving storage. When unset, no
         /// section is written and enclaves keep today's behavior
-        /// (nbd-client's wiring is opted in by SYNCHRONIZER_ENABLED,
-        /// which the launcher sets, and then fail-stops on a missing
-        /// section). The backend supplies this at build time; the
-        /// values MUST come from build-time config, never from the
-        /// running host.
+        /// (nbd-client's wiring is opted in by --synchronizer-enabled,
+        /// below, and then fail-stops on a missing section). The backend
+        /// supplies this at build time; the values MUST come from
+        /// build-time config, never from the running host.
         #[arg(long)]
         synchronizer_pcrs: Option<String>,
+
+        /// Turn ON the in-enclave anti-rollback wiring (enclavia#208):
+        /// stamp `synchronizer.enabled = true` into the measured config,
+        /// which the EIF init reads to export `SYNCHRONIZER_ENABLED=1`
+        /// for the nbd-client. REQUIRES --synchronizer-pcrs (an enabled
+        /// wiring with no expected oracle PCRs would fail-stop the
+        /// enclave at every boot). Without this flag the wiring stays
+        /// off even if anchors are baked in, so an enclave can ship the
+        /// anchors disabled and be flipped on by a later rebuild.
+        #[arg(long)]
+        synchronizer_enabled: bool,
     },
 }
 
@@ -608,6 +618,7 @@ fn write_enclavia_config(
     enclave_id: Option<&str>,
     image_digest: Option<&str>,
     synchronizer_pcrs: Option<&[PcrValues]>,
+    synchronizer_enabled: bool,
 ) -> Result<()> {
     let mut config = serde_json::json!({
         "listen_vsock_port": 5000,
@@ -657,6 +668,7 @@ fn write_enclavia_config(
     // pinning keep today's config byte-for-byte).
     if let Some(pcrs) = synchronizer_pcrs {
         config["synchronizer"] = serde_json::json!({
+            "enabled": synchronizer_enabled,
             "expected_pcrs": pcrs,
             "debug_attestation": debug,
         });
@@ -671,6 +683,7 @@ fn write_enclavia_config(
         has_enclave_id = enclave_id.is_some(),
         has_image_digest = image_digest.is_some(),
         synchronizer_pcr_sets = synchronizer_pcrs.map(<[_]>::len).unwrap_or(0),
+        synchronizer_enabled,
         "wrote enclavia config"
     );
     Ok(())
@@ -690,6 +703,7 @@ async fn build(
     image_digest: Option<&str>,
     egress_allowlist: Option<&Path>,
     synchronizer_pcrs: Option<&[PcrValues]>,
+    synchronizer_enabled: bool,
 ) -> Result<BuildResult> {
     let tmp = tempfile::tempdir()?;
     let tmp_path = tmp.path();
@@ -719,6 +733,7 @@ async fn build(
         enclave_id,
         image_digest,
         synchronizer_pcrs,
+        synchronizer_enabled,
     )?;
 
     // 4b. If the caller supplied an egress allowlist, drop it into the
@@ -779,6 +794,7 @@ async fn main() {
             image_digest,
             egress_allowlist,
             synchronizer_pcrs,
+            synchronizer_enabled,
         } => {
             let creds = match (&registry_user, &registry_password) {
                 (Some(u), Some(p)) => Some((u.as_str(), p.as_str())),
@@ -810,6 +826,17 @@ async fn main() {
                 None => None,
             };
 
+            // Enabling the wiring without expected oracle PCRs would
+            // make the in-enclave nbd-client fail-stop at every boot
+            // (unverifiable oracle), so refuse the combination here.
+            if synchronizer_enabled && synchronizer_pcrs.is_none() {
+                error!(
+                    "--synchronizer-enabled requires --synchronizer-pcrs (the in-enclave \
+                     nbd-client fail-stops at boot with no expected oracle PCRs)"
+                );
+                std::process::exit(2);
+            }
+
             match build(
                 &image,
                 creds,
@@ -823,6 +850,7 @@ async fn main() {
                 image_digest.as_deref(),
                 egress_allowlist.as_deref(),
                 synchronizer_pcrs.as_deref(),
+                synchronizer_enabled,
             )
             .await
             {
@@ -960,6 +988,7 @@ mod tests {
         debug: bool,
         storage: bool,
         synchronizer_pcrs: Option<&[PcrValues]>,
+        synchronizer_enabled: bool,
     ) -> serde_json::Value {
         let dir = tempfile::tempdir().unwrap();
         write_enclavia_config(
@@ -971,6 +1000,7 @@ mod tests {
             Some("enclave-uuid"),
             None,
             synchronizer_pcrs,
+            synchronizer_enabled,
         )
         .unwrap();
         let content = std::fs::read_to_string(dir.path().join("enclavia-config.json")).unwrap();
@@ -981,7 +1011,7 @@ mod tests {
     fn config_has_no_synchronizer_section_when_flag_absent() {
         // Enclaves built without --synchronizer-pcrs must keep today's
         // config shape (and therefore today's PCRs for unchanged inputs).
-        let config = written_config(false, true, None);
+        let config = written_config(false, true, None, false);
         assert!(config.get("synchronizer").is_none());
         assert_eq!(config["storage"]["enabled"], serde_json::json!(true));
     }
@@ -992,7 +1022,7 @@ mod tests {
         // PcrsHex deserialize: synchronizer.expected_pcrs[].PCR{0,1,2}
         // plus synchronizer.debug_attestation.
         let triples = vec![triple('a'), triple('b')];
-        let config = written_config(false, true, Some(&triples));
+        let config = written_config(false, true, Some(&triples), false);
         let section = &config["synchronizer"];
         assert_eq!(section["debug_attestation"], serde_json::json!(false));
         let expected = section["expected_pcrs"].as_array().unwrap();
@@ -1010,7 +1040,7 @@ mod tests {
     #[test]
     fn config_debug_attestation_mirrors_debug_flag() {
         let triples = vec![triple('a')];
-        let config = written_config(true, true, Some(&triples));
+        let config = written_config(true, true, Some(&triples), false);
         assert_eq!(
             config["synchronizer"]["debug_attestation"],
             serde_json::json!(true)
@@ -1020,9 +1050,22 @@ mod tests {
     #[test]
     fn config_base_fields_survive_synchronizer_section() {
         let triples = vec![triple('a')];
-        let config = written_config(false, false, Some(&triples));
+        let config = written_config(false, false, Some(&triples), false);
         assert_eq!(config["listen_vsock_port"], serde_json::json!(5000));
         assert_eq!(config["enclave_id"], serde_json::json!("enclave-uuid"));
         assert!(config.get("storage").is_none());
+    }
+
+    #[test]
+    fn config_synchronizer_enabled_flag_is_written() {
+        let triples = vec![triple('a')];
+        // Anchors baked but wiring OFF: enabled defaults false, so the
+        // EIF init does not export SYNCHRONIZER_ENABLED.
+        let off = written_config(false, true, Some(&triples), false);
+        assert_eq!(off["synchronizer"]["enabled"], serde_json::json!(false));
+        // Wiring ON: init reads `synchronizer.enabled == true` and
+        // exports SYNCHRONIZER_ENABLED=1 for nbd-client.
+        let on = written_config(false, true, Some(&triples), true);
+        assert_eq!(on["synchronizer"]["enabled"], serde_json::json!(true));
     }
 }
