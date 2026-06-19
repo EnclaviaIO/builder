@@ -338,7 +338,9 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
         # Diagnostic path: skip LUKS entirely. Format btrfs directly on the
         # raw NBD device and mount it. Used to isolate the proxy's behaviour
         # from cryptsetup's KDF + 16 MiB header wipe overhead on TCG.
-        /bin/blkid /dev/nbd0 >/dev/null 2>&1 || /bin/mkfs.btrfs -f /dev/nbd0
+        # -m single: see the LUKS path below — DUP metadata is redundant
+        # over EBS and doubles per-commit write I/O.
+        /bin/blkid /dev/nbd0 >/dev/null 2>&1 || /bin/mkfs.btrfs -f -m single /dev/nbd0
         /bin/mkdir -p /data
         /bin/mount -o noatime,noexec,nosuid,nodev /dev/nbd0 /data
         echo "storage: btrfs mounted at /data (LUKS bypassed, diagnostic mode)"
@@ -363,7 +365,16 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
         # Format with btrfs on first boot. Btrfs gives us csum-tree-rooted
         # tamper detection; the per-superblock-write hooks in nbd-client
         # rely on btrfs's fixed superblock offsets {64KiB, 64MiB, 256GiB}.
-        /bin/blkid /dev/mapper/encdata >/dev/null 2>&1 || /bin/mkfs.btrfs -f /dev/mapper/encdata
+        #
+        # `-m single`: btrfs defaults metadata to DUP (two copies on a single
+        # device, even on SSD in recent btrfs-progs), which doubles metadata
+        # write I/O on every commit. The backing store is EBS over NBD/vsock
+        # and already provides durable replication, so DUP's local-corruption
+        # protection is redundant; single metadata roughly halves the writes
+        # per durable commit (the dominant cost in the storage write path —
+        # see enclavia-crates docs/synchronizer-storage-latency.md). The csum
+        # tree and the fixed superblock offsets are unaffected by the profile.
+        /bin/blkid /dev/mapper/encdata >/dev/null 2>&1 || /bin/mkfs.btrfs -f -m single /dev/mapper/encdata
         /bin/mkdir -p /data
         /bin/mount -o noatime,noexec,nosuid,nodev /dev/mapper/encdata /data
         echo "storage: LUKS-encrypted btrfs mounted at /data"
