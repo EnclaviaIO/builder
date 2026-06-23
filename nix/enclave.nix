@@ -178,6 +178,18 @@ let
     cp ${initScript} $out/bin/enclave-init
     chmod +x $out/bin/enclave-init
 
+    # Host vsock CID marker (enclavia#50 real-Nitro path). The in-enclave
+    # binaries default the host CID to 3 (VMADDR_CID_PARENT, correct for
+    # real AWS Nitro), so production needs no override. Under QEMU +
+    # vhost-device-vsock the host bridge answers on CID 2
+    # (VMADDR_CID_HOST), so a debug EIF carries `2` here and init.sh
+    # exports VSOCK_HOST_CID / EGRESS_VSOCK_CID from it before launching
+    # the in-enclave processes. Writing the value into the MEASURED rootfs
+    # (rather than passing it on the host-controlled kernel cmdline) keeps
+    # it inside the PCRs: the debug-vs-prod CID is part of the enclave's
+    # attested identity, not something the host can flip at runtime.
+    printf '${if debugMode then "2" else "3"}\n' > $out/etc/enclavia/host-cid
+
     # Enclavia config. This file carries the enclave's trust anchors
     # (#47 control_public_key, enclavia#208 synchronizer.expected_pcrs +
     # debug_attestation), which are only worth anything because they sit

@@ -49,6 +49,34 @@ fi
 /bin/ip link set lo up
 /bin/ip addr add 127.0.0.1/8 dev lo 2>/dev/null || true
 
+# --- Host vsock CID (enclavia#50 real-Nitro path) ---
+# The in-enclave binaries (enclavia-crypto, nbd-client, enclavia-server,
+# enclavia-egress) default the host CID to 3 (VMADDR_CID_PARENT, correct
+# on real AWS Nitro). Under QEMU + vhost-device-vsock the host bridge
+# answers on CID 2 instead, so a debug EIF carries `2` in the measured
+# rootfs marker /etc/enclavia/host-cid and we export it here BEFORE any
+# in-enclave process is launched (every one below is a child of this
+# shell, so the export propagates). On a production EIF the marker holds
+# `3` and exporting it is a harmless no-op over the binaries' default.
+# We deliberately read the MEASURED rootfs file rather than the
+# host-controlled kernel cmdline: the CID is part of the enclave's
+# attested identity. Both VSOCK_HOST_CID and EGRESS_VSOCK_CID are set
+# from the same value (egress uses its own env var name).
+if [ -r /etc/enclavia/host-cid ]; then
+    HOST_CID=""
+    read -r HOST_CID < /etc/enclavia/host-cid || true
+    case "$HOST_CID" in
+        2|3)
+            export VSOCK_HOST_CID="$HOST_CID"
+            export EGRESS_VSOCK_CID="$HOST_CID"
+            echo "init: host vsock CID = ${HOST_CID}"
+            ;;
+        *)
+            echo "WARNING: /etc/enclavia/host-cid has unexpected value '${HOST_CID}'; using binary defaults (CID 3)" >&2
+            ;;
+    esac
+fi
+
 # --- Outbound network egress ---
 # When enclavia-egress is present, start it before crun so the workload's
 # default route through tun0 is in place by the time the container runs.
@@ -304,7 +332,8 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
         echo "init: synchronizer anti-rollback wiring ENABLED"
     fi
 
-    # Start NBD client — connects to host via vsock CID 2:5001, sets up /dev/nbd0.
+    # Start NBD client — connects to host via vsock <VSOCK_HOST_CID>:5001
+    # (CID 3 on real Nitro, 2 under QEMU), sets up /dev/nbd0.
     # In skip-LUKS diagnostic mode, the proxy sees raw btrfs writes (no dm-crypt
     # offset translation), so superblock offsets line up at LUKS_DATA_OFFSET=0.
     if [ "$SKIP_LUKS" = "true" ]; then
