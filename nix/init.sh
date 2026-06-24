@@ -354,8 +354,57 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
         /bin/mkdir -p "$ROOTFS/data"
         /bin/mount --bind /data "$ROOTFS/data" 2>/dev/null || true
     else
+        # --- AWS credentials for the in-enclave KMS call (#199 / #198) ---
+        # `enclavia-crypto init` below talks to KMS using in-enclave TLS
+        # and hand-rolled SigV4, so it needs AWS_* credentials in ITS
+        # process env. crypto inherits init.sh's environment, so we land
+        # the creds in init.sh's own env here, BEFORE the call.
+        #
+        # We reuse the #169 host->enclave secrets channel, but a SECOND
+        # pass with a different SINK: `--mode aws-creds` pulls a CBOR map
+        # of AWS_* over vsock 5013 (a SEPARATE port from the 5004
+        # workload-secrets pass — the host daemon is single-shot, so
+        # same-port-twice would race) and writes it to a tmpfs env file
+        # (/run/aws-creds.env, KEY=VALUE lines) instead of patching the
+        # OCI bundle. We then source + export it so crypto sees the vars.
+        #
+        # Only present when the EIF baked in enclavia-secrets-init AND
+        # the host stood up the creds daemon. On real Nitro the launcher
+        # forwards IMDS instance-role creds; under QEMU they are static
+        # dummies (mock-kms ignores SigV4). Boot-only: creds rotate
+        # ~hourly but the KMS checks here run once, at boot.
+        #
+        # The pull is fatal-on-failure inside the binary (a missing host
+        # daemon means crypto would fail to auth anyway), so `set -e`
+        # promotes any failure to a boot abort with a clear log line.
+        if [ -x /bin/enclavia-secrets-init ]; then
+            echo "init: pulling AWS creds for KMS (vsock 5013) before enclavia-crypto init"
+            /bin/enclavia-secrets-init --mode aws-creds /run/aws-creds.env
+            if [ -f /run/aws-creds.env ]; then
+                # The file is validated clean (KEY=value, valid shell
+                # identifiers, no newlines) by enclavia-secrets-init, so
+                # `set -a; . file; set +a` is safe and exports every
+                # entry into init.sh's env for the crypto child.
+                set -a
+                # shellcheck disable=SC1091
+                . /run/aws-creds.env
+                set +a
+            fi
+        fi
+
         # Get/create LUKS passphrase via KMS (writes /tmp/luks.key).
         /bin/enclavia-crypto init
+
+        # --- Scrub the AWS creds (load-bearing) ---
+        # crypto has consumed them; nothing else at boot needs them. The
+        # customer workload must NEVER see kms:Decrypt-capable creds, so
+        # unset the vars from init.sh's env (they'd otherwise be inherited
+        # by nothing the workload reads — the OCI process.env is built
+        # explicitly — but unset anyway for defense in depth) and delete
+        # the tmpfs file BEFORE crun start further down. The upgrade flow
+        # re-fetches creds via the control path, not from this file.
+        unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION
+        /bin/rm -f /run/aws-creds.env
 
         if ! /bin/cryptsetup isLuks /dev/nbd0 2>/dev/null; then
             /bin/cryptsetup luksFormat \
