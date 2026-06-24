@@ -27,13 +27,14 @@ let
   arch = "x86_64";
   blobs = nitroLib.blobs.${arch};
 
-  # Patched init for the debug EIF. Unlike AWS' stock init (which heartbeats
-  # only the Nitro parent at CID 3), this one heartbeats BOTH CID 3 and CID 2
+  # The init for ALL EIFs (debug and prod alike). Unlike AWS' stock blob
+  # init (which heartbeats only the Nitro parent at CID 3 and can't be
+  # modified), this one we control: it heartbeats BOTH CID 3 and CID 2
   # (VMADDR_CID_HOST, where QEMU's vhost-device-vsock answers), so a single
-  # debug EIF boots on both QEMU and real Nitro. Prod still uses the stock
-  # AWS init blob.
+  # EIF boots on both QEMU and real Nitro. It is a port of AWS'
+  # aws-nitro-enclaves-sdk-bootstrap init.c.
   patchedInit = pkgs.buildGoModule {
-    name = "eif-init-debug";
+    name = "eif-init";
     src = ./init-patched;
     vendorHash = null;
     env.CGO_ENABLED = 0;
@@ -222,9 +223,14 @@ let
     cp -r ${ociBundlePath} $out/var/lib/oci/bundle
   '';
 
-  initBinary = if debugMode
-    then "${patchedInit}/bin/init"
-    else blobs.init;
+  # Always the patched init (never AWS's stock CID-3-only blob init), so a
+  # single EIF boots on both QEMU and real Nitro: the patched init
+  # heartbeats CID 3 (Nitro parent) AND CID 2 (vhost-device-vsock host), and
+  # the in-enclave binaries probe the host CID at runtime. This is what lets
+  # `enclavia reproduce` actually boot a Nitro-built image locally on QEMU,
+  # not just compare PCRs. (debugMode no longer affects the init; it only
+  # drives debug-attestation trust anchors in config.json.)
+  initBinary = "${patchedInit}/bin/init";
 
 in
   nitroLib.buildEif {
