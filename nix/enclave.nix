@@ -181,10 +181,13 @@ let
     cp ${initScript} $out/bin/enclave-init
     chmod +x $out/bin/enclave-init
 
-    # (No host-vsock-CID marker is baked in: the in-enclave binaries probe
-    # for it at runtime via enclavia-vsock::host_cid -- CID 3 on real Nitro,
-    # CID 2 under QEMU -- and the patched init heartbeats to both. One EIF
-    # boots in either environment with nothing to flip per-build.)
+    # (No host-vsock-CID marker is baked into the measured rootfs: the
+    # patched init heartbeats BOTH CIDs at boot, then writes whichever one
+    # answered -- CID 3 on real Nitro, CID 2 under QEMU -- to
+    # /run/enclavia-host-cid, and the in-enclave binaries read it via
+    # enclavia-vsock::host_cid. The CID is a runtime fact, not part of the
+    # enclave's identity, so it stays off the measured image. One EIF boots
+    # in either environment with nothing to flip per-build.)
 
     # Enclavia config. This file carries the enclave's trust anchors
     # (#47 control_public_key, enclavia#208 synchronizer.expected_pcrs +
@@ -225,8 +228,9 @@ let
 
   # Always the patched init (never AWS's stock CID-3-only blob init), so a
   # single EIF boots on both QEMU and real Nitro: the patched init
-  # heartbeats CID 3 (Nitro parent) AND CID 2 (vhost-device-vsock host), and
-  # the in-enclave binaries probe the host CID at runtime. This is what lets
+  # heartbeats CID 3 (Nitro parent) AND CID 2 (vhost-device-vsock host), then
+  # records whichever answered to /run/enclavia-host-cid for the in-enclave
+  # binaries to read (enclavia-vsock::host_cid). This is what lets
   # `enclavia reproduce` actually boot a Nitro-built image locally on QEMU,
   # not just compare PCRs. (debugMode no longer affects the init; it only
   # drives debug-attestation trust anchors in config.json.)
