@@ -49,6 +49,12 @@ fi
 /bin/ip link set lo up
 /bin/ip addr add 127.0.0.1/8 dev lo 2>/dev/null || true
 
+# --- Host vsock CID ---
+# Nothing to do here: the in-enclave binaries probe for the host CID at
+# runtime (enclavia-vsock::host_cid -- CID 3 on real Nitro, CID 2 under
+# QEMU), and the patched init heartbeats to both. One EIF, no per-build
+# CID baking or env export.
+
 # --- Outbound network egress ---
 # When enclavia-egress is present, start it before crun so the workload's
 # default route through tun0 is in place by the time the container runs.
@@ -304,7 +310,8 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
         echo "init: synchronizer anti-rollback wiring ENABLED"
     fi
 
-    # Start NBD client — connects to host via vsock CID 2:5001, sets up /dev/nbd0.
+    # Start NBD client — connects to host via vsock <VSOCK_HOST_CID>:5001
+    # (CID 3 on real Nitro, 2 under QEMU), sets up /dev/nbd0.
     # In skip-LUKS diagnostic mode, the proxy sees raw btrfs writes (no dm-crypt
     # offset translation), so superblock offsets line up at LUKS_DATA_OFFSET=0.
     if [ "$SKIP_LUKS" = "true" ]; then

@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -19,7 +20,12 @@ const (
 	NSM_PATH         = "nsm.ko"
 	TIMEOUT          = 20000 // millis
 	VSOCK_PORT       = 9000
-	VSOCK_CID        = 2
+	// Heartbeat targets. Real AWS Nitro answers at the parent
+	// (VMADDR_CID_PARENT == 3); QEMU + vhost-device-vsock answers at the
+	// host (VMADDR_CID_HOST == 2). We heartbeat to both so one EIF works
+	// in either environment (see enclaveReady).
+	VSOCK_PARENT_CID = 3
+	VSOCK_HOST_CID   = 2
 	HEART_BEAT       = 0xB7
 	RB_AUTOBOOT      = 0x1234567
 )
@@ -275,13 +281,70 @@ func readFile(path string) ([]string, error) {
 	return contents, nil
 }
 
-func enclaveReady() error {
+// enclaveReady signals readiness by completing the heartbeat handshake with
+// the host. It dials BOTH the real Nitro parent (CID 3) and the QEMU /
+// vhost-device-vsock host (CID 2) concurrently and succeeds as soon as
+// either handshake completes, so a single EIF boots in both environments.
+// A connect that hangs on the wrong CID just leaves its goroutine blocked
+// harmlessly (this runs exactly once at boot); the overall TIMEOUT guards
+// against the case where neither answers.
+//
+// It returns the CID that answered: that is the definitive host CID for
+// this boot, which we persist (see writeHostCid) so the in-enclave binaries
+// read it rather than re-probing post-boot, when the parent's readiness
+// listener on CID 3:9000 may already be gone.
+func enclaveReady() (uint32, error) {
+	type result struct {
+		cid uint32
+		err error
+	}
+	ch := make(chan result, 2)
+	for _, cid := range []uint32{VSOCK_PARENT_CID, VSOCK_HOST_CID} {
+		go func(c uint32) { ch <- result{c, heartbeatOnce(c)} }(cid)
+	}
+	deadline := time.After(TIMEOUT * time.Millisecond)
+	var lastErr error
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-ch:
+			if r.err == nil {
+				return r.cid, nil
+			}
+			lastErr = r.err
+		case <-deadline:
+			return 0, errors.New("heartbeat timed out on both CID 3 and CID 2")
+		}
+	}
+	return 0, lastErr
+}
+
+// HOST_CID_PATH is where we record the host CID the heartbeat answered on,
+// for the in-enclave binaries to read (mirrors enclavia_vsock::HOST_CID_PATH
+// on the Rust side). It lives on the /run tmpfs, so this must be called only
+// after that tmpfs is mounted (initFsOrDie) and after the chroot into
+// /rootfs, so the path matches what the binaries see.
+const HOST_CID_PATH = "/run/enclavia-host-cid"
+
+func writeHostCid(cid uint32) {
+	data := []byte(fmt.Sprintf("%d\n", cid))
+	if err := os.WriteFile(HOST_CID_PATH, data, 0644); err != nil {
+		// Non-fatal: the binaries fall back to a reachability probe when
+		// the file is absent. Surface it on the console so a wrong-CID
+		// fallback has a traceable cause.
+		warn("failed to write " + HOST_CID_PATH + ": " + err.Error())
+	}
+}
+
+// heartbeatOnce performs the one-byte heartbeat handshake against a single
+// host CID.
+func heartbeatOnce(cid uint32) error {
 	socket, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
 	if err != nil {
 		return newErr(err, "failed open socket")
 	}
+	defer unix.Close(socket)
 	err = unix.Connect(socket, &unix.SockaddrVM{
-		CID:   VSOCK_CID,
+		CID:   cid,
 		Port:  VSOCK_PORT,
 		Flags: 0,
 	})
@@ -300,11 +363,6 @@ func enclaveReady() error {
 	}
 	if buf[0] != HEART_BEAT {
 		return errors.New("received wrong heartbeat")
-	}
-
-	err = unix.Close(socket)
-	if err != nil {
-		return newErr(err, "close vsock")
 	}
 	return nil
 }
@@ -341,9 +399,11 @@ func main() {
 		die("failed to init console", err)
 	}
 	initNsm()
-	if err := enclaveReady(); err != nil {
+	hostCid, err := enclaveReady()
+	if err != nil {
 		die("failed to notify readiness", err)
 	}
+	warn(fmt.Sprint("enclave ready: host vsock CID = ", hostCid))
 
 	env, err := readFile("/env")
 	if err != nil {
@@ -366,6 +426,11 @@ func main() {
 	}
 
 	initFsOrDie(ops)
+
+	// /run is now a mounted tmpfs inside the chroot, so the in-enclave
+	// binaries see the same path. Record the heartbeat-detected host CID
+	// for them to read (enclavia_vsock::host_cid).
+	writeHostCid(hostCid)
 
 	if err := initCgroups(); err != nil {
 		die("failed to init cgroups", err)
