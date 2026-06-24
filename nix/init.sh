@@ -49,33 +49,11 @@ fi
 /bin/ip link set lo up
 /bin/ip addr add 127.0.0.1/8 dev lo 2>/dev/null || true
 
-# --- Host vsock CID (enclavia#50 real-Nitro path) ---
-# The in-enclave binaries (enclavia-crypto, nbd-client, enclavia-server,
-# enclavia-egress) default the host CID to 3 (VMADDR_CID_PARENT, correct
-# on real AWS Nitro). Under QEMU + vhost-device-vsock the host bridge
-# answers on CID 2 instead, so a debug EIF carries `2` in the measured
-# rootfs marker /etc/enclavia/host-cid and we export it here BEFORE any
-# in-enclave process is launched (every one below is a child of this
-# shell, so the export propagates). On a production EIF the marker holds
-# `3` and exporting it is a harmless no-op over the binaries' default.
-# We deliberately read the MEASURED rootfs file rather than the
-# host-controlled kernel cmdline: the CID is part of the enclave's
-# attested identity. Both VSOCK_HOST_CID and EGRESS_VSOCK_CID are set
-# from the same value (egress uses its own env var name).
-if [ -r /etc/enclavia/host-cid ]; then
-    HOST_CID=""
-    read -r HOST_CID < /etc/enclavia/host-cid || true
-    case "$HOST_CID" in
-        2|3)
-            export VSOCK_HOST_CID="$HOST_CID"
-            export EGRESS_VSOCK_CID="$HOST_CID"
-            echo "init: host vsock CID = ${HOST_CID}"
-            ;;
-        *)
-            echo "WARNING: /etc/enclavia/host-cid has unexpected value '${HOST_CID}'; using binary defaults (CID 3)" >&2
-            ;;
-    esac
-fi
+# --- Host vsock CID ---
+# Nothing to do here: the in-enclave binaries probe for the host CID at
+# runtime (enclavia-vsock::host_cid -- CID 3 on real Nitro, CID 2 under
+# QEMU), and the patched init heartbeats to both. One EIF, no per-build
+# CID baking or env export.
 
 # --- Outbound network egress ---
 # When enclavia-egress is present, start it before crun so the workload's

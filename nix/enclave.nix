@@ -27,9 +27,11 @@ let
   arch = "x86_64";
   blobs = nitroLib.blobs.${arch};
 
-  # In debug mode (QEMU + vhost-device-vsock UDS backend), the init binary
-  # must connect to CID 2 (VSOCK_HOST_CID) instead of CID 3 (Nitro parent).
-  # Build a patched init with the correct CID.
+  # Patched init for the debug EIF. Unlike AWS' stock init (which heartbeats
+  # only the Nitro parent at CID 3), this one heartbeats BOTH CID 3 and CID 2
+  # (VMADDR_CID_HOST, where QEMU's vhost-device-vsock answers), so a single
+  # debug EIF boots on both QEMU and real Nitro. Prod still uses the stock
+  # AWS init blob.
   patchedInit = pkgs.buildGoModule {
     name = "eif-init-debug";
     src = ./init-patched;
@@ -178,17 +180,10 @@ let
     cp ${initScript} $out/bin/enclave-init
     chmod +x $out/bin/enclave-init
 
-    # Host vsock CID marker (enclavia#50 real-Nitro path). The in-enclave
-    # binaries default the host CID to 3 (VMADDR_CID_PARENT, correct for
-    # real AWS Nitro), so production needs no override. Under QEMU +
-    # vhost-device-vsock the host bridge answers on CID 2
-    # (VMADDR_CID_HOST), so a debug EIF carries `2` here and init.sh
-    # exports VSOCK_HOST_CID / EGRESS_VSOCK_CID from it before launching
-    # the in-enclave processes. Writing the value into the MEASURED rootfs
-    # (rather than passing it on the host-controlled kernel cmdline) keeps
-    # it inside the PCRs: the debug-vs-prod CID is part of the enclave's
-    # attested identity, not something the host can flip at runtime.
-    printf '${if debugMode then "2" else "3"}\n' > $out/etc/enclavia/host-cid
+    # (No host-vsock-CID marker is baked in: the in-enclave binaries probe
+    # for it at runtime via enclavia-vsock::host_cid -- CID 3 on real Nitro,
+    # CID 2 under QEMU -- and the patched init heartbeats to both. One EIF
+    # boots in either environment with nothing to flip per-build.)
 
     # Enclavia config. This file carries the enclave's trust anchors
     # (#47 control_public_key, enclavia#208 synchronizer.expected_pcrs +
