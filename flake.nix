@@ -372,8 +372,8 @@
           cleanup() {
               echo ""
               echo "storage-test-vm: cleaning up..."
-              kill "''${HEARTBEAT_PID:-}" "''${VHOST_PID:-}" "''${STORAGE_PID:-}" "''${MOCK_KMS_PID:-}" "''${AWS_CREDS_PID:-}" 2>/dev/null || true
-              wait "''${HEARTBEAT_PID:-}" "''${VHOST_PID:-}" "''${STORAGE_PID:-}" "''${MOCK_KMS_PID:-}" "''${AWS_CREDS_PID:-}" 2>/dev/null || true
+              kill "''${HEARTBEAT_PID:-}" "''${VHOST_PID:-}" "''${STORAGE_PID:-}" "''${MOCK_KMS_PID:-}" "''${AWS_CREDS_PID:-}" "''${SECRETS_PID:-}" 2>/dev/null || true
+              wait "''${HEARTBEAT_PID:-}" "''${VHOST_PID:-}" "''${STORAGE_PID:-}" "''${MOCK_KMS_PID:-}" "''${AWS_CREDS_PID:-}" "''${SECRETS_PID:-}" 2>/dev/null || true
               if [ -f "''${BACKING_FILE}" ]; then
                   BLOCKS=$(${pkgs.coreutils}/bin/stat --format=%b "''${BACKING_FILE}")
                   SIZE=$(${pkgs.coreutils}/bin/stat --format=%s "''${BACKING_FILE}")
@@ -523,6 +523,46 @@
               exit 1
           fi
           echo "storage-test-vm: aws-creds secrets-host ready"
+
+          # 5c. Start the workload-secrets secrets-host (#169) on vsock
+          # 5004. The storage EIF bakes `enclavia-secrets-init`, and
+          # init.sh's FINAL pass (`enclavia-secrets-init /var/lib/oci/bundle`,
+          # default `--mode workload-secrets`) dials vsock 5004 right
+          # before `crun start` to inject the workload's OCI-bundle env.
+          # That binary treats ANY vsock connect failure as fatal (it has
+          # no "exit 0 when no daemon is listening" path), so the real
+          # local-qemu launcher ALWAYS stands up a 5004 secrets-host —
+          # even for an enclave with no secrets — serving an empty CBOR
+          # map (see enclavia-crates launcher/local_qemu.rs: "'no secrets
+          # configured' has to look the same from its side as 'secrets
+          # configured': a listener that answers with a CBOR map").
+          # Without it the guest's 5004 dial connects to a non-existent
+          # ''${PROXY_SOCKET}_5004, vhost-device-vsock cannot reach a host
+          # app, the guest connect times out (os error 110), and init.sh's
+          # `set -e` aborts the boot just before crun. We serve an empty
+          # map (empty stdin -> secrets-host serves `0xa0`); the storage
+          # test workload reads its env from the kernel cmdline, not from
+          # injected secrets, so an empty map is exactly right.
+          SECRETS_VSOCK_PORT=5004
+          SECRETS_LISTEN_PATH="''${PROXY_SOCKET}_''${SECRETS_VSOCK_PORT}"
+          SECRETS_PAYLOAD="''${SOCK_DIR}/workload-secrets.cbor"
+          # Empty file -> secrets-host serves an empty CBOR map after EOF.
+          : > "''${SECRETS_PAYLOAD}"
+          echo "storage-test-vm: starting workload-secrets secrets-host on ''${SECRETS_LISTEN_PATH} (empty map)..."
+          LISTEN_PATH="''${SECRETS_LISTEN_PATH}" \
+          RUST_LOG="''${RUST_LOG:-info}" \
+              ${secretsHostBin} < "''${SECRETS_PAYLOAD}" &
+          SECRETS_PID=$!
+
+          for i in $(${pkgs.coreutils}/bin/seq 1 50); do
+              [ -S "''${SECRETS_LISTEN_PATH}" ] && break
+              ${pkgs.coreutils}/bin/sleep 0.1
+          done
+          if [ ! -S "''${SECRETS_LISTEN_PATH}" ]; then
+              echo "storage-test-vm: ERROR: workload-secrets secrets-host socket not ready" >&2
+              exit 1
+          fi
+          echo "storage-test-vm: workload-secrets secrets-host ready"
 
           # 6. Launch QEMU
           echo ""
