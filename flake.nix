@@ -38,11 +38,11 @@
     # Override during local development with
     # `--override-input enclavia path:../enclavia`.
     enclavia = {
-      # Pinned to the branch HEAD of EnclaviaIO/enclavia#26
-      # (feat/expose-chain-init-flake), which adds
-      # `enclavia-chain-init` as a flake package output. Re-bump
-      # to the post-squash master SHA once that PR merges.
-      url = "github:EnclaviaIO/enclavia/b6bb06a0b2a8d072bd97270db44f6ac0f6a4f6e4";
+      # Pinned to EnclaviaIO/enclavia master after #52
+      # (secrets-init --mode aws-creds), the in-enclave creds sink that
+      # init.sh's AWS-creds boot pass dials on vsock 5013. Re-bump when a
+      # newer in-enclave change is needed.
+      url = "github:EnclaviaIO/enclavia/2c2341a6fe8241b08f3dff7dc40d544bf2c41a1e";
     };
   };
 
@@ -300,7 +300,13 @@
         test-storage-bundle = pkgs.callPackage ./nix/test-storage-bundle.nix { inherit pkgs; };
 
         test-enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg;
+          # enclaviaSecretsInitPkg is baked in here (unlike the other
+          # test EIFs) because the storage path runs `enclavia-crypto
+          # init`, which on real Nitro needs AWS_* creds pulled by
+          # `enclavia-secrets-init --mode aws-creds` from vsock 5013
+          # before the KMS call (#199 / #198). The storage e2e exercises
+          # that pull -> source -> scrub flow with static dummy creds.
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
           ociBundlePath = test-storage-bundle;
           debugMode = true;
           storageEnabled = true;
@@ -355,13 +361,19 @@
           STORAGE_VSOCK_PORT=5001
           META_VSOCK_PORT=5002
           KMS_VSOCK_PORT=5003
+          # AWS-creds boot pass (#199 / #198): the in-enclave
+          # `enclavia-crypto init` pulls AWS_* creds from a second
+          # secrets-host on this port before the KMS call. mock-kms
+          # ignores SigV4, so static dummy creds exercise the full
+          # pull -> source -> scrub flow.
+          AWS_CREDS_VSOCK_PORT=5013
           KMS_KEY_ID="${testKmsKeyId}"
 
           cleanup() {
               echo ""
               echo "storage-test-vm: cleaning up..."
-              kill "''${HEARTBEAT_PID:-}" "''${VHOST_PID:-}" "''${STORAGE_PID:-}" "''${MOCK_KMS_PID:-}" 2>/dev/null || true
-              wait "''${HEARTBEAT_PID:-}" "''${VHOST_PID:-}" "''${STORAGE_PID:-}" "''${MOCK_KMS_PID:-}" 2>/dev/null || true
+              kill "''${HEARTBEAT_PID:-}" "''${VHOST_PID:-}" "''${STORAGE_PID:-}" "''${MOCK_KMS_PID:-}" "''${AWS_CREDS_PID:-}" 2>/dev/null || true
+              wait "''${HEARTBEAT_PID:-}" "''${VHOST_PID:-}" "''${STORAGE_PID:-}" "''${MOCK_KMS_PID:-}" "''${AWS_CREDS_PID:-}" 2>/dev/null || true
               if [ -f "''${BACKING_FILE}" ]; then
                   BLOCKS=$(${pkgs.coreutils}/bin/stat --format=%b "''${BACKING_FILE}")
                   SIZE=$(${pkgs.coreutils}/bin/stat --format=%s "''${BACKING_FILE}")
@@ -468,6 +480,49 @@
               exit 1
           fi
           echo "storage-test-vm: mock-kms ready"
+
+          # 5b. Start the AWS-creds secrets-host (#199 / #198). A SECOND
+          # single-shot enclavia-secrets-host instance, on the dedicated
+          # creds port 5013 (distinct from the 5004 workload-secrets
+          # port — same-port-twice would race the single-shot daemon),
+          # serving a CBOR map of static dummy AWS creds. The in-enclave
+          # `enclavia-secrets-init --mode aws-creds` pulls it before
+          # `enclavia-crypto init`, lands it in init.sh's env via
+          # /run/aws-creds.env, and init.sh scrubs it before crun start.
+          # mock-kms ignores SigV4, so dummy creds are sufficient to
+          # drive the full plumbing + scrub end to end.
+          AWS_CREDS_LISTEN_PATH="''${PROXY_SOCKET}_''${AWS_CREDS_VSOCK_PORT}"
+          AWS_CREDS_PAYLOAD="''${SOCK_DIR}/aws-creds.cbor"
+          # CBOR encoding of the dummy creds map, matching the wire type
+          # the host serves and the in-enclave secrets-init decodes:
+          # BTreeMap<String, Vec<u8>>. KEYS are CBOR text strings
+          # (0x60+len for len<24); VALUES are CBOR BYTE strings (Vec<u8>:
+          # 0x40+len for len<24, else 0x58 <len>) — NOT text strings.
+          # a4 = map of 4 pairs; BTreeMap order is lexicographic.
+          #   key AWS_ACCESS_KEY_ID(17,0x71)     val(21,0x55)
+          #   key AWS_REGION(10,0x6a)            val(12,0x4c)
+          #   key AWS_SECRET_ACCESS_KEY(21,0x75) val(43,0x58 0x2b)
+          #   key AWS_SESSION_TOKEN(17,0x71)     val(31,0x58 0x1f)
+          # Hand-encoded so the wrapper needs no CBOR tooling; the byte
+          # layout is round-trip-verified against ciborium.
+          ${pkgs.coreutils}/bin/printf '%b' '\xa4\x71AWS_ACCESS_KEY_ID\x55AKIADUMMYSTORAGEE2E00\x6aAWS_REGION\x4ceu-central-1\x75AWS_SECRET_ACCESS_KEY\x58\x2bdummystoragee2esecret0000000000000000000000\x71AWS_SESSION_TOKEN\x58\x1fdummy-storage-e2e-session-token' \
+              > "''${AWS_CREDS_PAYLOAD}"
+          echo "storage-test-vm: starting aws-creds secrets-host on ''${AWS_CREDS_LISTEN_PATH}..."
+          LISTEN_PATH="''${AWS_CREDS_LISTEN_PATH}" \
+          RUST_LOG="''${RUST_LOG:-info}" \
+              ${secretsHostBin} --port "''${AWS_CREDS_VSOCK_PORT}" \
+              < "''${AWS_CREDS_PAYLOAD}" &
+          AWS_CREDS_PID=$!
+
+          for i in $(${pkgs.coreutils}/bin/seq 1 50); do
+              [ -S "''${AWS_CREDS_LISTEN_PATH}" ] && break
+              ${pkgs.coreutils}/bin/sleep 0.1
+          done
+          if [ ! -S "''${AWS_CREDS_LISTEN_PATH}" ]; then
+              echo "storage-test-vm: ERROR: aws-creds secrets-host socket not ready" >&2
+              exit 1
+          fi
+          echo "storage-test-vm: aws-creds secrets-host ready"
 
           # 6. Launch QEMU
           echo ""
