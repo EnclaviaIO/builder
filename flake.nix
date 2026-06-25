@@ -38,11 +38,11 @@
     # Override during local development with
     # `--override-input enclavia path:../enclavia`.
     enclavia = {
-      # Pinned to the branch HEAD of EnclaviaIO/enclavia#26
-      # (feat/expose-chain-init-flake), which adds
-      # `enclavia-chain-init` as a flake package output. Re-bump
-      # to the post-squash master SHA once that PR merges.
-      url = "github:EnclaviaIO/enclavia/b6bb06a0b2a8d072bd97270db44f6ac0f6a4f6e4";
+      # Pinned to EnclaviaIO/enclavia master after #52
+      # (secrets-init --mode aws-creds), the in-enclave creds sink that
+      # init.sh's AWS-creds boot pass dials on vsock 5013. Re-bump when a
+      # newer in-enclave change is needed.
+      url = "github:EnclaviaIO/enclavia/2c2341a6fe8241b08f3dff7dc40d544bf2c41a1e";
     };
   };
 
