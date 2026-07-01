@@ -237,6 +237,90 @@ async fn unpack_bundle(oci_layout: &Path, bundle_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Replace the image's hardlinks in the bundle rootfs with relative symlinks.
+///
+/// Base images (busybox, alpine, distroless, ...) hardlink hundreds of applets
+/// to a single binary. Nix's NAR format does not represent hardlinks, so when
+/// the bundle is imported into the store as a `path:` input every hardlink
+/// becomes an independent full copy -- a ~4 MB rootfs explodes to ~400 MB,
+/// which bloats the measured rootfs -> cpio -> EIF until it overshoots the
+/// enclave memory allocation and `nitro-cli run-enclave` fails with E26.
+/// Symlinks, unlike hardlinks, are preserved by nix and by every `cp -r` in
+/// nitro-util's ramdisk build, so the packed image stays the source size.
+///
+/// We touch ONLY files the image itself hardlinked (`nlink > 1`, shared
+/// inode): those are explicitly the same file, and hardlinked names already
+/// share one inode's permissions, so a symlink (which resolves to the target's
+/// perms) changes nothing. We deliberately do NOT dedup merely
+/// identical-content files -- the image may keep those separate on purpose.
+/// Deterministic (keeps the lexicographically-smallest path in each hardlink
+/// group) so EIFs stay bit-reproducible.
+fn dehardlink_bundle(bundle_dir: &Path) -> Result<()> {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::MetadataExt;
+
+    let rootfs = bundle_dir.join("rootfs");
+    if !rootfs.is_dir() {
+        return Ok(());
+    }
+
+    // Group regular files that have more than one link by (device, inode).
+    let mut groups: BTreeMap<(u64, u64), Vec<PathBuf>> = BTreeMap::new();
+    for entry in walkdir::WalkDir::new(&rootfs) {
+        let entry = entry.map_err(std::io::Error::from)?;
+        // symlink_metadata = lstat: never follow symlinks (a symlink is not a
+        // regular file, so it is skipped anyway, but be explicit).
+        let meta = entry.path().symlink_metadata()?;
+        if meta.is_file() && meta.nlink() > 1 {
+            groups
+                .entry((meta.dev(), meta.ino()))
+                .or_default()
+                .push(entry.path().to_path_buf());
+        }
+    }
+
+    let mut converted = 0usize;
+    for (_inode, mut paths) in groups {
+        if paths.len() < 2 {
+            continue;
+        }
+        paths.sort();
+        let canonical = &paths[0];
+        for dup in &paths[1..] {
+            let target = relative_symlink_target(dup, canonical);
+            std::fs::remove_file(dup)?;
+            std::os::unix::fs::symlink(&target, dup)?;
+            converted += 1;
+        }
+    }
+
+    if converted > 0 {
+        info!(converted, "converted bundle hardlinks to relative symlinks");
+    }
+    Ok(())
+}
+
+/// Path of `target` expressed relative to the directory containing `link`
+/// (both absolute and sharing a common ancestor, e.g. the bundle rootfs).
+fn relative_symlink_target(link: &Path, target: &Path) -> PathBuf {
+    let link_dir = link.parent().unwrap_or_else(|| Path::new(""));
+    let link_comps: Vec<_> = link_dir.components().collect();
+    let target_comps: Vec<_> = target.components().collect();
+    let common = link_comps
+        .iter()
+        .zip(target_comps.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut rel = PathBuf::new();
+    for _ in common..link_comps.len() {
+        rel.push("..");
+    }
+    for c in &target_comps[common..] {
+        rel.push(c.as_os_str());
+    }
+    rel
+}
+
 /// Patch the OCI bundle config for enclave compatibility.
 ///
 /// The enclave runs a single container as root on an initramfs. Namespace
@@ -720,6 +804,15 @@ async fn build(
     info!("unpacking OCI bundle");
     unpack_bundle(&oci_layout, &bundle_dir).await?;
 
+    // 2b. Convert the image's hardlinks to relative symlinks BEFORE nix sees
+    // the bundle. Nix's NAR format can't represent hardlinks, so importing the
+    // bundle `path:` flattens every hardlink into an independent full copy: a
+    // ~4 MB busybox/alpine rootfs (hundreds of applets hardlinked to one
+    // binary) balloons to ~400 MB, bloating the EIF past the enclave's memory
+    // allocation (nitro-cli E26). Symlinks survive nix and the ramdisk build
+    // untouched. Must happen here, while the hardlink structure still exists.
+    dehardlink_bundle(&bundle_dir)?;
+
     // 3. Patch OCI config for enclave compatibility
     patch_bundle_config(&bundle_dir)?;
 
@@ -1067,5 +1160,54 @@ mod tests {
         // exports SYNCHRONIZER_ENABLED=1 for nbd-client.
         let on = written_config(false, true, Some(&triples), true);
         assert_eq!(on["synchronizer"]["enabled"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn dehardlink_converts_only_hardlinks_to_relative_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("bin")).unwrap();
+        std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+
+        // A hardlink group of three names sharing one inode (like busybox).
+        std::fs::write(rootfs.join("bin/busybox"), b"BUSYBOX").unwrap();
+        std::fs::hard_link(rootfs.join("bin/busybox"), rootfs.join("bin/ls")).unwrap();
+        std::fs::hard_link(rootfs.join("bin/busybox"), rootfs.join("usr/bin/cat")).unwrap();
+        // An INDEPENDENT file with identical content (separate inode) must be
+        // left alone -- we only touch what the image itself hardlinked.
+        std::fs::write(rootfs.join("bin/other"), b"BUSYBOX").unwrap();
+
+        dehardlink_bundle(tmp.path()).unwrap();
+
+        // Canonical = lexicographically-smallest path in the group; stays real.
+        assert!(rootfs
+            .join("bin/busybox")
+            .symlink_metadata()
+            .unwrap()
+            .is_file());
+        // The other two names became symlinks that still read the same bytes.
+        for name in ["bin/ls", "usr/bin/cat"] {
+            let p = rootfs.join(name);
+            assert!(
+                p.symlink_metadata().unwrap().file_type().is_symlink(),
+                "{name} should be a symlink"
+            );
+            assert_eq!(std::fs::read(&p).unwrap(), b"BUSYBOX");
+        }
+        // Targets are RELATIVE so they resolve inside the container chroot.
+        assert_eq!(
+            std::fs::read_link(rootfs.join("bin/ls")).unwrap(),
+            PathBuf::from("busybox")
+        );
+        assert_eq!(
+            std::fs::read_link(rootfs.join("usr/bin/cat")).unwrap(),
+            PathBuf::from("../../bin/busybox")
+        );
+        // The independent identical-content file is untouched.
+        assert!(rootfs
+            .join("bin/other")
+            .symlink_metadata()
+            .unwrap()
+            .is_file());
     }
 }
