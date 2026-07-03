@@ -389,6 +389,22 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
                 # shellcheck disable=SC1091
                 . /run/aws-creds.env
                 set +a
+                # `enclavia-crypto init` selects its real-KMS transport
+                # (in-enclave TLS + SigV4 to kms.<region>.amazonaws.com)
+                # off KMS_AWS_REGION; the creds feed delivers the region
+                # under the standard name AWS_REGION. Bridge the two, but
+                # ONLY on real Nitro (host CID 3): under QEMU the same
+                # feed carries a dummy region, and KMS there is the
+                # plaintext mock-kms, so KMS_AWS_REGION must stay unset to
+                # keep crypto on its Mock transport. Without this bridge
+                # the production genesis silently runs in Mock mode and
+                # speaks plaintext to the TLS KMS endpoint (blob ciphertext
+                # stays null, the volume is never LUKS-formatted).
+                HOST_CID=""
+                read -r HOST_CID < /run/enclavia-host-cid 2>/dev/null || true
+                if [ "$HOST_CID" = "3" ] && [ -n "$AWS_REGION" ]; then
+                    export KMS_AWS_REGION="$AWS_REGION"
+                fi
             fi
         fi
 
@@ -403,7 +419,7 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
         # explicitly — but unset anyway for defense in depth) and delete
         # the tmpfs file BEFORE crun start further down. The upgrade flow
         # re-fetches creds via the control path, not from this file.
-        unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION
+        unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION KMS_AWS_REGION
         /bin/rm -f /run/aws-creds.env
 
         if ! /bin/cryptsetup isLuks /dev/nbd0 2>/dev/null; then
