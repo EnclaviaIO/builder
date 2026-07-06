@@ -133,6 +133,17 @@ enum Cli {
         /// anchors disabled and be flipped on by a later rebuild.
         #[arg(long)]
         synchronizer_enabled: bool,
+
+        /// Create-time immutable minimum upgrade activation delay in
+        /// seconds (enclavia-crates#205). When set (and non-zero), the
+        /// value is stamped into `enclavia-config.json`, which lands at
+        /// `/etc/enclavia/config.json` inside the MEASURED rootfs
+        /// (PCR2), so the in-enclave server can reject a PrepareUpgrade
+        /// whose valid_from is earlier than now + this delay. Absent or
+        /// 0 keeps current behavior (no field written, config bytes
+        /// identical for existing enclaves).
+        #[arg(long, value_name = "SECS")]
+        min_upgrade_delay_secs: Option<u64>,
     },
 }
 
@@ -703,6 +714,7 @@ fn write_enclavia_config(
     image_digest: Option<&str>,
     synchronizer_pcrs: Option<&[PcrValues]>,
     synchronizer_enabled: bool,
+    min_upgrade_delay_secs: Option<u64>,
 ) -> Result<()> {
     let mut config = serde_json::json!({
         "listen_vsock_port": 5000,
@@ -758,6 +770,16 @@ fn write_enclavia_config(
         });
     }
 
+    // Minimum upgrade activation delay (enclavia-crates#205). Measured
+    // into PCR2 like control_public_key, so the host can't shorten it
+    // after creation. Explicit 0 is treated the same as absent so the
+    // config bytes stay identical for existing enclaves.
+    if let Some(d) = min_upgrade_delay_secs {
+        if d > 0 {
+            config["min_upgrade_delay_secs"] = d.into();
+        }
+    }
+
     let path = bundle_dir.join("enclavia-config.json");
     std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap())?;
     info!(
@@ -768,6 +790,7 @@ fn write_enclavia_config(
         has_image_digest = image_digest.is_some(),
         synchronizer_pcr_sets = synchronizer_pcrs.map(<[_]>::len).unwrap_or(0),
         synchronizer_enabled,
+        min_upgrade_delay_secs = min_upgrade_delay_secs.unwrap_or(0),
         "wrote enclavia config"
     );
     Ok(())
@@ -788,6 +811,7 @@ async fn build(
     egress_allowlist: Option<&Path>,
     synchronizer_pcrs: Option<&[PcrValues]>,
     synchronizer_enabled: bool,
+    min_upgrade_delay_secs: Option<u64>,
 ) -> Result<BuildResult> {
     let tmp = tempfile::tempdir()?;
     let tmp_path = tmp.path();
@@ -827,6 +851,7 @@ async fn build(
         image_digest,
         synchronizer_pcrs,
         synchronizer_enabled,
+        min_upgrade_delay_secs,
     )?;
 
     // 4b. If the caller supplied an egress allowlist, drop it into the
@@ -888,6 +913,7 @@ async fn main() {
             egress_allowlist,
             synchronizer_pcrs,
             synchronizer_enabled,
+            min_upgrade_delay_secs,
         } => {
             let creds = match (&registry_user, &registry_password) {
                 (Some(u), Some(p)) => Some((u.as_str(), p.as_str())),
@@ -944,6 +970,7 @@ async fn main() {
                 egress_allowlist.as_deref(),
                 synchronizer_pcrs.as_deref(),
                 synchronizer_enabled,
+                min_upgrade_delay_secs,
             )
             .await
             {
@@ -1083,6 +1110,16 @@ mod tests {
         synchronizer_pcrs: Option<&[PcrValues]>,
         synchronizer_enabled: bool,
     ) -> serde_json::Value {
+        written_config_with_delay(debug, storage, synchronizer_pcrs, synchronizer_enabled, None)
+    }
+
+    fn written_config_with_delay(
+        debug: bool,
+        storage: bool,
+        synchronizer_pcrs: Option<&[PcrValues]>,
+        synchronizer_enabled: bool,
+        min_upgrade_delay_secs: Option<u64>,
+    ) -> serde_json::Value {
         let dir = tempfile::tempdir().unwrap();
         write_enclavia_config(
             dir.path(),
@@ -1094,6 +1131,7 @@ mod tests {
             None,
             synchronizer_pcrs,
             synchronizer_enabled,
+            min_upgrade_delay_secs,
         )
         .unwrap();
         let content = std::fs::read_to_string(dir.path().join("enclavia-config.json")).unwrap();
@@ -1160,6 +1198,27 @@ mod tests {
         // exports SYNCHRONIZER_ENABLED=1 for nbd-client.
         let on = written_config(false, true, Some(&triples), true);
         assert_eq!(on["synchronizer"]["enabled"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn config_min_upgrade_delay_written_when_set() {
+        // The exact key the in-enclave server reads (enclavia-crates#205).
+        let config = written_config_with_delay(false, false, None, false, Some(86400));
+        assert_eq!(
+            config["min_upgrade_delay_secs"],
+            serde_json::json!(86400u64)
+        );
+    }
+
+    #[test]
+    fn config_min_upgrade_delay_absent_when_none_or_zero() {
+        // None and explicit 0 must both leave the field out, so config
+        // bytes stay identical for existing enclaves (stable PCR2).
+        let none = written_config_with_delay(false, false, None, false, None);
+        assert!(none.get("min_upgrade_delay_secs").is_none());
+        let zero = written_config_with_delay(false, false, None, false, Some(0));
+        assert!(zero.get("min_upgrade_delay_secs").is_none());
+        assert_eq!(none, zero);
     }
 
     #[test]
