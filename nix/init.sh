@@ -99,7 +99,10 @@ if [ -x /bin/enclavia-egress ]; then
     fi
 
     # Render the unbound config from the template. The template's
-    # `server:` block ends with `local-zone: "." refuse` (default-deny).
+    # `server:` block ends with `local-zone: "." refuse` (default-deny);
+    # when egress.json says `"dns": "open"` that line is rewritten to
+    # `transparent` so unbound resolves any name (the connect-time
+    # egress allowlist still applies unchanged).
     # We append, in order:
     #   1. one `local-zone: "<host>." transparent` per allow-listed
     #      hostname in egress.json (still inside the server: block,
@@ -119,6 +122,7 @@ if [ -x /bin/enclavia-egress ]; then
     if [ -x /bin/unbound ] && [ -f /etc/unbound/unbound.conf.template ]; then
         RESOLVERS=""
         HOSTNAMES=""
+        DNS_MODE="allowlist"
         if [ -f /etc/enclavia/egress.json ]; then
             # Resolvers are dotted-quad IPv4 strings under .resolvers.
             RESOLVERS=$(/bin/jq -r '.resolvers // [] | .[]' /etc/enclavia/egress.json)
@@ -131,10 +135,41 @@ if [ -x /bin/enclavia-egress ]; then
                 | .host
                 | select(test("^[0-9.]+(/[0-9]+)?$") | not)
             ' /etc/enclavia/egress.json)
+            # DNS resolution mode: `allowlist` (default) keeps the
+            # template's `local-zone: "." refuse`; `open` swaps it for
+            # `transparent` so unbound resolves any name. Connect-time
+            # egress enforcement is unaffected either way; this only
+            # controls what unbound is willing to answer.
+            DNS_MODE=$(/bin/jq -r '.dns // "allowlist"' /etc/enclavia/egress.json)
         fi
 
         /bin/mkdir -p /etc/unbound
-        /bin/cp /etc/unbound/unbound.conf.template /etc/unbound/unbound.conf
+        case "$DNS_MODE" in
+            open)
+                # awk, not sed: the rootfs busybox does not ship sed.
+                # The marker matched here is the template's default-deny
+                # line; keep the two in sync.
+                /bin/awk '{
+                    if ($0 ~ /^[ \t]*local-zone: "\." refuse[ \t]*$/)
+                        print "    local-zone: \".\" transparent"
+                    else
+                        print
+                }' /etc/unbound/unbound.conf.template > /etc/unbound/unbound.conf
+                echo "unbound: dns mode open (resolving any name)" >&2
+                ;;
+            allowlist)
+                /bin/cp /etc/unbound/unbound.conf.template /etc/unbound/unbound.conf
+                ;;
+            *)
+                # Unknown value. The schema validation upstream (CLI +
+                # backend) rejects anything but allowlist/open, so this
+                # is belt-and-braces: fall back to the restrictive
+                # default rather than failing the boot.
+                echo "unbound: WARNING: unknown dns mode '$DNS_MODE', defaulting to allowlist" >&2
+                DNS_MODE="allowlist"
+                /bin/cp /etc/unbound/unbound.conf.template /etc/unbound/unbound.conf
+                ;;
+        esac
 
         # Per-hostname allowlist overrides. These extend the server:
         # block of the template (no new section header has been written
