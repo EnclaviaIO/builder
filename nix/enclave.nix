@@ -75,7 +75,16 @@ let
       } // (if skipLuks then { skip_luks = true; } else {});
     } else {})));
 
-  initScript = pkgs.writeShellScript "enclave-init" (builtins.readFile ./init.sh);
+  # Plain copy of init.sh, keeping its own `#!/bin/sh` shebang (resolved
+  # to the busybox sh baked into the rootfs). Deliberately NOT
+  # writeShellScript: that prepends a `#!/nix/store/...-bash` shebang,
+  # which drags the full bash closure (bash + ncurses + readline) into
+  # the measured image for a script that is already POSIX sh.
+  initScript = pkgs.writeTextFile {
+    name = "enclave-init";
+    executable = true;
+    text = builtins.readFile ./init.sh;
+  };
 
   # In-enclave validating DNS resolver (#136). Static musl build from
   # nixpkgs so it drops cleanly into the initramfs with no shared-library
@@ -89,12 +98,41 @@ let
   # the PCRs and is auditable via `enclavia reproduce`.
   rootKey = "${pkgs.dns-root-data}/root.key";
 
+  # Minimal static crun. The stock nixpkgs crun is dynamically linked
+  # and its nix closure is enormous for an initramfs: criu (which pulls
+  # a full python3), libkrun + libkrunfw (a ~20 MiB microVM kernel
+  # blob), systemd-minimal, glibc, sqlite, bash... none of which the
+  # enclave ever executes -- we only need `crun run` on a pre-patched
+  # bundle. Building it static (musl) with checkpoint/restore, systemd
+  # cgroup support and the krun handler disabled turns a ~300 MiB
+  # closure into one ~2 MiB self-contained binary.
+  crunMinimal =
+    (pkgs.pkgsStatic.crun.override {
+      withLibkrun = false;
+      withLibkrunSEV = false;
+      # Null buildInputs are skipped by mkDerivation; configure then
+      # simply doesn't find criu/systemd and compiles the fallbacks.
+      criu = null;
+      systemdMinimal = null;
+    }).overrideAttrs (old: {
+      # The stock derivation force-links criu.
+      env = (old.env or { }) // { NIX_LDFLAGS = ""; };
+      configureFlags = (old.configureFlags or [ ]) ++ [
+        "--disable-criu"
+        "--disable-systemd"
+      ];
+      # The test suite needs container privileges and a dynamic host
+      # toolchain; irrelevant for this static build.
+      doCheck = false;
+      doInstallCheck = false;
+    });
+
   rootfs = pkgs.runCommand "enclave-rootfs" {} ''
     mkdir -p $out/bin $out/etc/enclavia $out/etc/unbound $out/var/lib/oci
 
     # Binaries
     cp ${enclaviaServerPkg}/bin/enclavia-server $out/bin/
-    cp ${pkgs.crun}/bin/crun $out/bin/
+    cp ${crunMinimal}/bin/crun $out/bin/
 
     ${if enclaviaSecretsInitPkg != null then ''
     # Per-enclave secrets injector (#169). init.sh dials vsock 5004 via
@@ -255,6 +293,25 @@ let
   # drives debug-attestation trust anchors in config.json.)
   initBinary = "${patchedInit}/bin/init";
 
+  # Rootfs plus the /nix/store closure the dynamically-linked binaries
+  # need at runtime (glibc + libgcc for the Rust in-enclave binaries).
+  # nitro-util's `copyToRootWithClosure = true` would do this for us,
+  # BUT its closure necessarily contains the rootfs derivation itself,
+  # so every byte of the rootfs -- including the whole customer OCI
+  # bundle -- used to be shipped twice: once at `/` and once under
+  # `/nix/store/...-enclave-rootfs/`. Nothing at runtime looks at the
+  # store copy (init.sh and the entrypoint only use the `/` layout), so
+  # pack the closure ourselves and skip the self-reference.
+  rootfsWithClosure = pkgs.runCommand "enclave-rootfs-with-closure" {} ''
+    mkdir -p $out/nix/store
+    for p in $(cat ${pkgs.closureInfo { rootPaths = [ rootfs ]; }}/store-paths); do
+      if [ "$p" != "${rootfs}" ]; then
+        cp -r $p $out/nix/store/
+      fi
+    done
+    cp -r ${rootfs}/* $out/
+  '';
+
 in
   nitroLib.buildEif {
     name = "enclavia-enclave";
@@ -266,7 +323,8 @@ in
       else blobs.kernelConfig;
     # Modern kernels (6.x+) have the NSM guest driver built-in
     nsmKo = if customKernel != null then null else blobs.nsmKo;
-    copyToRoot = rootfs;
+    copyToRoot = rootfsWithClosure;
+    copyToRootWithClosure = false;
     entrypoint = "/bin/enclave-init";
     init = initBinary;
   }
