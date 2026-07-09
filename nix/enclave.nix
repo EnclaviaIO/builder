@@ -131,7 +131,9 @@ let
       doInstallCheck = false;
     });
 
-  rootfs = pkgs.runCommand "enclave-rootfs" {} ''
+  rootfs = pkgs.runCommand "enclave-rootfs" {
+    nativeBuildInputs = [ pkgs.nukeReferences ];
+  } ''
     mkdir -p $out/bin $out/etc/enclavia $out/etc/unbound $out/var/lib/oci
 
     # Binaries
@@ -285,6 +287,24 @@ let
 
     # OCI bundle (customer's image)
     cp -r ${ociBundlePath} $out/var/lib/oci/bundle
+
+    # The static tool binaries embed /nix/store path *strings* (configure
+    # defaults, package metadata) they never dereference at runtime:
+    # everything they need is either linked in or passed explicitly by
+    # init.sh (unbound gets -c, jq/busybox/cryptsetup take no config).
+    # Left in place, each string would pull that store path -- and its
+    # transitive closure -- into the measured initramfs via the
+    # closure-packing step below. Scrub them. The enclavia Rust binaries
+    # are deliberately NOT scrubbed: if they are dynamically linked their
+    # glibc references are load-bearing (ELF interpreter), and the
+    # closure step must see them.
+    for tool in crun busybox jq unbound cryptsetup mkfs.btrfs blkid; do
+      if [ -f "$out/bin/$tool" ]; then
+        chmod +w "$out/bin/$tool"
+        nuke-refs "$out/bin/$tool"
+        chmod -w "$out/bin/$tool"
+      fi
+    done
   '';
 
   # Always the patched init (never AWS's stock CID-3-only blob init), so a
