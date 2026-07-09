@@ -115,6 +115,10 @@ let
       criu = null;
       systemdMinimal = null;
     }).overrideAttrs (old: {
+      # musl has no argp; crun's option parser needs the standalone lib.
+      buildInputs = (old.buildInputs or [ ]) ++ [
+        pkgs.pkgsStatic.argp-standalone
+      ];
       # The stock derivation force-links criu.
       env = (old.env or { }) // { NIX_LDFLAGS = ""; };
       configureFlags = (old.configureFlags or [ ]) ++ [
