@@ -132,6 +132,7 @@ let
     ln -s busybox $out/bin/grep
     ln -s busybox $out/bin/tr
     ln -s busybox $out/bin/nc
+    ln -s busybox $out/bin/nsenter
     ln -s busybox $out/bin/printf
     ln -s busybox $out/bin/nslookup
     ln -s busybox $out/bin/cp
@@ -174,6 +175,24 @@ let
     cp ${unboundConfTemplate} $out/etc/unbound/unbound.conf.template
     cp ${rootKey} $out/etc/unbound/root.key
     chmod 0644 $out/etc/unbound/root.key
+
+    # Real (static) iproute2 for the network-namespace split that
+    # isolates unbound (resolver-bypass hardening). busybox `ip` has no `netns` /
+    # `link ... netns` support, so init.sh uses this binary for the
+    # veth + netns setup; the existing lo/tun0 commands stay on
+    # busybox `ip`. Named distinctly to avoid changing the busybox
+    # applet the rest of init.sh relies on.
+    cp ${pkgs.pkgsStatic.iproute2}/bin/ip $out/bin/iproute2-ip
+
+    # Static legacy iptables (xtables-legacy backend; the enclave
+    # kernel builds CONFIG_IP_NF_IPTABLES/FILTER, not nf_tables). One
+    # boot-time OUTPUT rule stops a workload forging the isolated
+    # resolver's source address with CAP_NET_RAW (resolver-bypass
+    # hardening). The
+    # multiplexer dispatches on argv0, so the `iptables` symlink
+    # selects the legacy applet.
+    cp ${pkgs.pkgsStatic.iptables}/bin/xtables-legacy-multi $out/bin/
+    ln -s xtables-legacy-multi $out/bin/iptables
     '' else ""}
 
     # Init script — must be inside the rootfs since the init binary

@@ -62,6 +62,26 @@ fi
 # configured local IP, and brings it up itself. We add the default route
 # once tun0 appears.
 if [ -x /bin/enclavia-egress ]; then
+    # --- Resolver network-namespace isolation (resolver-bypass hardening) ---
+    # unbound runs in its own network namespace connected to the init
+    # netns by a veth pair, so its upstream forwarder traffic reaches
+    # tun0 from a source address (RESOLVER_IP) distinct from the
+    # workload's (the tun address). The egress daemon trusts only
+    # RESOLVER_IP for the auto-injected resolver:53 entries, so a
+    # workload can no longer bypass unbound by dialing a resolver on
+    # TCP/53 directly. The workload stays in the init netns, so the
+    # documented inbound 127.0.0.1:<port> contract is untouched.
+    RESOLVER_NS="resolver"
+    RESOLVER_VETH_HOST="veth-r"     # init-netns end
+    RESOLVER_VETH_NS="veth-rns"     # resolver-netns end
+    RESOLVER_SUBNET="10.99.2.0/24"
+    RESOLVER_GW_IP="10.99.2.1"      # veth-r (init netns)
+    RESOLVER_IP="10.99.2.2"         # veth-rns (resolver netns) == unbound
+    # `iproute2-ip` is the real static iproute2 (busybox `ip` has no
+    # netns/veth support); `/bin/ip` stays busybox for the simple
+    # lo/tun0 commands elsewhere in this script.
+    IPR=/bin/iproute2-ip
+
     # Ensure /dev/net/tun exists. devtmpfs auto-creates it when CONFIG_TUN=y,
     # but the parent directory /dev/net is only created when the first
     # devtmpfs entry under it is registered; mknod ourselves if missing.
@@ -171,6 +191,18 @@ if [ -x /bin/enclavia-egress ]; then
                 ;;
         esac
 
+        # unbound now runs in the resolver netns, so it must listen on
+        # the veth address the workload reaches it at (queries arrive
+        # sourced from the init-netns veth end, RESOLVER_GW_IP). The
+        # template still binds 127.0.0.1 too, which stays valid as the
+        # resolver-netns loopback. These are extra server: clauses; no
+        # section header has been written yet.
+        {
+            printf '    interface: %s\n' "$RESOLVER_IP"
+            printf '    access-control: 127.0.0.0/8 allow\n'
+            printf '    access-control: %s allow\n' "$RESOLVER_SUBNET"
+        } >> /etc/unbound/unbound.conf
+
         # Per-hostname allowlist overrides. These extend the server:
         # block of the template (no new section header has been written
         # yet), each one punching a hole in `local-zone: "." refuse`.
@@ -201,11 +233,52 @@ if [ -x /bin/enclavia-egress ]; then
             echo "unbound: WARNING: no resolvers in egress.json, hostname allowlist entries will deny" >&2
         fi
 
-        # Start unbound. It listens on 127.0.0.1:53 once it's up; the
-        # readiness check below TCP-connects to that port in a loop
-        # (unbound-control is not in the rootfs, dig isn't either, but
-        # a plain TCP connect is enough to confirm the listener is up).
-        /bin/unbound -c /etc/unbound/unbound.conf -d >/tmp/unbound.log 2>&1 &
+        # Build the resolver netns and the veth pair that links it to
+        # the init netns. `ip netns add` bind-mounts a fresh net
+        # namespace under /var/run/netns in the ROOT mount namespace (it
+        # does not need CLONE_NEWNS, which is what fails on this
+        # initramfs), so it works here where crun's mount-ns setup
+        # would not. `ip netns add` does a bare (non-recursive)
+        # `mkdir /var/run/netns`, so its parent must already exist; the
+        # enclave initramfs ships no /var/run, so pre-create it or the
+        # add fails ENOENT and set -e aborts the boot (reboot loop).
+        /bin/mkdir -p /var/run/netns
+        "$IPR" netns add "$RESOLVER_NS"
+        "$IPR" link add "$RESOLVER_VETH_HOST" type veth peer name "$RESOLVER_VETH_NS"
+        "$IPR" link set "$RESOLVER_VETH_NS" netns "$RESOLVER_NS"
+        # Init-netns end: gateway address for the resolver subnet.
+        "$IPR" addr add "${RESOLVER_GW_IP}/24" dev "$RESOLVER_VETH_HOST"
+        "$IPR" link set "$RESOLVER_VETH_HOST" up
+        # Resolver-netns end: unbound's address + loopback + a default
+        # route back out through the init netns (where tun0 lives).
+        #
+        # Enter the netns with `nsenter -n<file>`, NOT `ip -n` /
+        # `ip netns exec`: the iproute2 forms unshare a MOUNT namespace
+        # and `mount --make-rslave /` + remount /sys, which fails with
+        # EINVAL on the enclave's ramfs root (the same mount-ns
+        # limitation that makes crun run with --no-pivot and no mount
+        # ns). nsenter -n joins ONLY the network namespace, and the
+        # ip link/addr/route ops below go over netlink (net-ns scoped),
+        # so they land in the resolver netns without touching mounts.
+        NSF="/var/run/netns/${RESOLVER_NS}"
+        /bin/nsenter -n"$NSF" "$IPR" link set lo up
+        /bin/nsenter -n"$NSF" "$IPR" addr add "${RESOLVER_IP}/24" dev "$RESOLVER_VETH_NS"
+        /bin/nsenter -n"$NSF" "$IPR" link set "$RESOLVER_VETH_NS" up
+        /bin/nsenter -n"$NSF" "$IPR" route add default via "$RESOLVER_GW_IP"
+        echo "unbound: resolver netns up (${RESOLVER_IP} via ${RESOLVER_GW_IP})"
+
+        # The egress daemon must trust the resolver's source address for
+        # the auto-injected resolver:53 entries. Exported here so it is
+        # in the daemon's environment when it starts below.
+        export EGRESS_TRUSTED_SRC="$RESOLVER_IP"
+        ISOLATED_UNBOUND=1
+
+        # Start unbound INSIDE the resolver netns (net ns only, via
+        # nsenter -n as above). It listens on RESOLVER_IP:53 (and its
+        # own loopback) once up; the readiness check below TCP-connects
+        # to RESOLVER_IP from the init netns over the veth.
+        /bin/nsenter -n"$NSF" \
+            /bin/unbound -c /etc/unbound/unbound.conf -d >/tmp/unbound.log 2>&1 &
     fi
 
     /bin/enclavia-egress >/tmp/egress.log 2>&1 &
@@ -223,17 +296,45 @@ if [ -x /bin/enclavia-egress ]; then
     if /bin/ip link show tun0 >/dev/null 2>&1; then
         /bin/ip route add default dev tun0 2>/dev/null || true
         echo "egress: tun0 up, default route installed"
+
+        # With unbound isolated, its upstream forwarder traffic is
+        # ROUTED from the resolver netns (in on veth-r, out tun0), so
+        # enable IPv4 forwarding.
+        if [ "${ISOLATED_UNBOUND:-0}" = "1" ]; then
+            echo 1 > /proc/sys/net/ipv4/ip_forward
+
+            # Anti-spoof: stop a workload forging the resolver's source
+            # address to reach a resolver on :53 directly (the exfil
+            # channel the resolver-bypass hardening closes). Legitimate
+            # resolver traffic is
+            # FORWARDED (in on veth-r), so it never traverses OUTPUT; a
+            # workload's raw-socket packet with a resolver-subnet source
+            # is LOCALLY generated and does, so this OUTPUT drop hits it
+            # without touching the real resolver path. Belt to the
+            # source-attribution braces in enclavia-egress: the daemon
+            # only trusts RESOLVER_IP, and this keeps that address
+            # unforgeable even with CAP_NET_RAW.
+            if [ -x /bin/iptables ]; then
+                /bin/iptables -A OUTPUT -o tun0 -s "$RESOLVER_SUBNET" -j DROP \
+                    && echo "egress: anti-spoof OUTPUT drop installed (${RESOLVER_SUBNET} -> tun0)" \
+                    || echo "WARNING: failed to install anti-spoof iptables rule" >&2
+            else
+                echo "WARNING: /bin/iptables missing; resolver source is not spoof-protected" >&2
+            fi
+        fi
     else
         echo "WARNING: tun0 did not come up; egress unavailable" >&2
     fi
 
-    # Wait for unbound to start listening on 127.0.0.1:53.
-    # busybox `nc -z` is the lightest available probe.
+    # Wait for unbound to start listening on RESOLVER_IP:53. The probe
+    # runs from the init netns and reaches unbound (in the resolver
+    # netns) over the veth, exactly as the workload will. busybox
+    # `nc -z` is the lightest available probe.
     if [ -x /bin/unbound ]; then
         i=0
         while [ $i -lt 50 ]; do
-            if /bin/nc -z 127.0.0.1 53 2>/dev/null; then
-                echo "unbound: ready on 127.0.0.1:53"
+            if /bin/nc -z "$RESOLVER_IP" 53 2>/dev/null; then
+                echo "unbound: ready on ${RESOLVER_IP}:53"
                 break
             fi
             /bin/sleep 0.1
@@ -267,7 +368,7 @@ if [ -x /bin/enclavia-egress ]; then
         ' /etc/enclavia/egress.json | /bin/awk 'NR==1')
         if [ -n "$WARMUP_HOST" ]; then
             for i in 1 2 3 4 5; do
-                if /bin/nslookup "$WARMUP_HOST" 127.0.0.1 >/dev/null 2>&1; then
+                if /bin/nslookup "$WARMUP_HOST" "$RESOLVER_IP" >/dev/null 2>&1; then
                     echo "unbound: pre-warmed upstream forwarder via $WARMUP_HOST"
                     break
                 fi
@@ -281,8 +382,8 @@ if [ -x /bin/enclavia-egress ]; then
     # forwarding chain (enclavia-egress -> vsock -> egress-host -> upstream)
     # is actually moving DNS packets. Real enclaves do not run this probe.
     if [ -n "$TEST_RESOLVER" ] && [ -x /bin/nslookup ]; then
-        echo "unbound-probe: querying one.one.one.one via 127.0.0.1"
-        if /bin/nslookup one.one.one.one 127.0.0.1 >/tmp/nslookup.log 2>&1; then
+        echo "unbound-probe: querying one.one.one.one via ${RESOLVER_IP}"
+        if /bin/nslookup one.one.one.one "$RESOLVER_IP" >/tmp/nslookup.log 2>&1; then
             if /bin/grep -q "1.1.1.1\|1.0.0.1" /tmp/nslookup.log; then
                 echo "unbound-probe: SUCCESS"
             else
@@ -499,9 +600,13 @@ fi
 # entries would silently never work). We only overwrite when the egress
 # stack is in the rootfs; storage-only / non-egress builds keep whatever
 # resolv.conf the OCI image baked in.
-if [ -x /bin/enclavia-egress ]; then
+#
+# unbound now lives in the resolver netns and answers on RESOLVER_IP
+# (reachable from the workload's init netns over the veth), NOT on the
+# workload's own loopback, so the nameserver is RESOLVER_IP.
+if [ -x /bin/enclavia-egress ] && [ "${ISOLATED_UNBOUND:-0}" = "1" ]; then
     /bin/mkdir -p "$ROOTFS/etc"
-    printf 'nameserver 127.0.0.1\noptions edns0\n' > "$ROOTFS/etc/resolv.conf"
+    printf 'nameserver %s\noptions edns0\n' "$RESOLVER_IP" > "$ROOTFS/etc/resolv.conf"
 fi
 
 # Plumb test-only egress targets to the workload via a known file. The
