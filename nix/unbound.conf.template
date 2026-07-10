@@ -81,4 +81,7 @@ server:
     # Default-deny for client queries. init.sh appends one
     # `local-zone: "<host>." transparent` per allow-listed hostname
     # below; everything else gets REFUSED at the listener.
+    # When egress.json sets `"dns": "open"`, init.sh rewrites this
+    # exact line to `local-zone: "." transparent` while rendering (the
+    # awk match keys on it verbatim, keep the two in sync).
     local-zone: "." refuse
