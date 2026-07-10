@@ -132,6 +132,7 @@ let
     ln -s busybox $out/bin/grep
     ln -s busybox $out/bin/tr
     ln -s busybox $out/bin/nc
+    ln -s busybox $out/bin/nsenter
     ln -s busybox $out/bin/printf
     ln -s busybox $out/bin/nslookup
     ln -s busybox $out/bin/cp

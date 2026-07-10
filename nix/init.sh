@@ -200,10 +200,14 @@ if [ -x /bin/enclavia-egress ]; then
 
         # Build the resolver netns and the veth pair that links it to
         # the init netns. `ip netns add` bind-mounts a fresh net
-        # namespace under /run/netns in the ROOT mount namespace (it
+        # namespace under /var/run/netns in the ROOT mount namespace (it
         # does not need CLONE_NEWNS, which is what fails on this
         # initramfs), so it works here where crun's mount-ns setup
-        # would not.
+        # would not. `ip netns add` does a bare (non-recursive)
+        # `mkdir /var/run/netns`, so its parent must already exist; the
+        # enclave initramfs ships no /var/run, so pre-create it or the
+        # add fails ENOENT and set -e aborts the boot (reboot loop).
+        /bin/mkdir -p /var/run/netns
         "$IPR" netns add "$RESOLVER_NS"
         "$IPR" link add "$RESOLVER_VETH_HOST" type veth peer name "$RESOLVER_VETH_NS"
         "$IPR" link set "$RESOLVER_VETH_NS" netns "$RESOLVER_NS"
@@ -212,10 +216,20 @@ if [ -x /bin/enclavia-egress ]; then
         "$IPR" link set "$RESOLVER_VETH_HOST" up
         # Resolver-netns end: unbound's address + loopback + a default
         # route back out through the init netns (where tun0 lives).
-        "$IPR" -n "$RESOLVER_NS" link set lo up
-        "$IPR" -n "$RESOLVER_NS" addr add "${RESOLVER_IP}/24" dev "$RESOLVER_VETH_NS"
-        "$IPR" -n "$RESOLVER_NS" link set "$RESOLVER_VETH_NS" up
-        "$IPR" -n "$RESOLVER_NS" route add default via "$RESOLVER_GW_IP"
+        #
+        # Enter the netns with `nsenter -n<file>`, NOT `ip -n` /
+        # `ip netns exec`: the iproute2 forms unshare a MOUNT namespace
+        # and `mount --make-rslave /` + remount /sys, which fails with
+        # EINVAL on the enclave's ramfs root (the same mount-ns
+        # limitation that makes crun run with --no-pivot and no mount
+        # ns). nsenter -n joins ONLY the network namespace, and the
+        # ip link/addr/route ops below go over netlink (net-ns scoped),
+        # so they land in the resolver netns without touching mounts.
+        NSF="/var/run/netns/${RESOLVER_NS}"
+        /bin/nsenter -n"$NSF" "$IPR" link set lo up
+        /bin/nsenter -n"$NSF" "$IPR" addr add "${RESOLVER_IP}/24" dev "$RESOLVER_VETH_NS"
+        /bin/nsenter -n"$NSF" "$IPR" link set "$RESOLVER_VETH_NS" up
+        /bin/nsenter -n"$NSF" "$IPR" route add default via "$RESOLVER_GW_IP"
         echo "unbound: resolver netns up (${RESOLVER_IP} via ${RESOLVER_GW_IP})"
 
         # The egress daemon must trust the resolver's source address for
@@ -224,11 +238,11 @@ if [ -x /bin/enclavia-egress ]; then
         export EGRESS_TRUSTED_SRC="$RESOLVER_IP"
         ISOLATED_UNBOUND=1
 
-        # Start unbound INSIDE the resolver netns. It listens on
-        # RESOLVER_IP:53 (and its own loopback) once up; the readiness
-        # check below TCP-connects to RESOLVER_IP from the init netns
-        # over the veth.
-        "$IPR" netns exec "$RESOLVER_NS" \
+        # Start unbound INSIDE the resolver netns (net ns only, via
+        # nsenter -n as above). It listens on RESOLVER_IP:53 (and its
+        # own loopback) once up; the readiness check below TCP-connects
+        # to RESOLVER_IP from the init netns over the veth.
+        /bin/nsenter -n"$NSF" \
             /bin/unbound -c /etc/unbound/unbound.conf -d >/tmp/unbound.log 2>&1 &
     fi
 
