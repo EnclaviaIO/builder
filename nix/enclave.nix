@@ -336,30 +336,8 @@ let
     cp -r ${rootfs}/* $out/
   '';
 
-  # User ramdisk, assembled like nitro-util's mkUserRamdisk (same /env,
-  # /cmd, /rootfs layout the init binary expects, same deterministic
-  # cpio) but compressed with xz instead of gzip: both the AWS blob
-  # kernel and our storage kernel ship CONFIG_RD_XZ, and xz -9e is
-  # ~45% smaller than gzip on this rootfs. Kernel constraints: CRC32
-  # (the in-kernel unxz does not do CRC64) and a single thread so the
-  # output is bit-reproducible regardless of builder core count.
-  userRamdisk = pkgs.runCommand "user-initramfs.cpio.xz" {
-    nativeBuildInputs = [ pkgs.cpio pkgs.xz ];
-  } ''
-    mkdir -p root/rootfs
-    cp ${pkgs.writeText "user-initramfs-env" ""} root/env
-    cp ${pkgs.writeText "user-initramfs-entrypoint" "/bin/enclave-init"} root/cmd
-    cp -r ${rootfsWithClosure}/* root/rootfs
-    (cd root/rootfs && mkdir -p dev run sys var proc tmp || true)
-
-    find root -exec touch -h --date=@1 {} +
-    (cd root && find * .[^.*] -print0 | sort -z \
-      | cpio -o -H newc -R +0:+0 --reproducible --null \
-      | xz -9 -e --check=crc32 -T1 > $out)
-  '';
-
 in
-  nitroLib.mkEif {
+  nitroLib.buildEif {
     name = "enclavia-enclave";
     kernel = if customKernel != null
       then "${customKernel}/bzImage"
@@ -367,12 +345,10 @@ in
     kernelConfig = if customKernel != null
       then customKernel.configfile
       else blobs.kernelConfig;
-    ramdisks = [
-      # Modern kernels (6.x+) have the NSM guest driver built-in
-      (nitroLib.mkSysRamdisk {
-        init = initBinary;
-        nsmKo = if customKernel != null then null else blobs.nsmKo;
-      })
-      userRamdisk
-    ];
+    # Modern kernels (6.x+) have the NSM guest driver built-in
+    nsmKo = if customKernel != null then null else blobs.nsmKo;
+    copyToRoot = rootfsWithClosure;
+    copyToRootWithClosure = false;
+    entrypoint = "/bin/enclave-init";
+    init = initBinary;
   }
