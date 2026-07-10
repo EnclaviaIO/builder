@@ -40,9 +40,44 @@ let
           REPLY=$( { printf 'ping\n'; sleep 5; } | nc -w 10 "$TARGET_IP" "$TARGET_PORT")
           echo "egress-test: got reply: $REPLY" >&2
           case "$REPLY" in
-            pong*) echo "egress-test: SUCCESS" >&2; exit 0 ;;
-            *) echo "egress-test: FAILURE (unexpected reply)" >&2; exit 1 ;;
+            pong*) echo "egress-test: positive egress OK" >&2 ;;
+            *) echo "egress-test: FAILURE (allowed dest did not reply pong)" >&2; exit 1 ;;
           esac
+
+          # --- DNS filter assertions ----------------------------------
+          # The workload's only intended DNS path is the in-enclave
+          # unbound (its resolv.conf points at the isolated resolver).
+          # Assert that path enforces the hostname allow-list: an
+          # allow-listed name resolves, a non-allow-listed one is
+          # REFUSED (unbound `local-zone "." refuse`). These are the
+          # reliable, workload-observable filter checks.
+          #
+          # NOTE on the direct-resolver bypass (the netns-split's whole
+          # point): it is NOT asserted here. The workload cannot observe
+          # the daemon's allow/deny decision, and neither a UDP nslookup
+          # (fails trivially: the egress path is TCP-only) nor a raw
+          # DNS-over-TCP probe discriminates: the daemon logs show that
+          # WITHOUT the source-gating the workload's resolver:53 flow is
+          # ALLOWED yet its splice still fails for a plain nc, so "no
+          # answer" happens on both the allowed and denied paths. The
+          # source-gating deny is covered by unit tests in the egress
+          # daemon (a workload-sourced resolver:53 connect is denied). An
+          # end-to-end assertion needs egress-daemon log observability,
+          # which belongs with the test-hooks refactor (builder#53).
+          resolves() { timeout 8 nslookup "$@" >/dev/null 2>&1; }
+
+          if ! resolves one.one.one.one; then
+            echo "egress-test: FAILURE (workload could not resolve an allow-listed name via unbound)" >&2; exit 1
+          fi
+          echo "egress-test: dns-allow (allow-listed name resolves via unbound) OK" >&2
+
+          if resolves example.org; then
+            echo "egress-test: FAILURE (unbound resolved a non-allow-listed name)" >&2; exit 1
+          fi
+          echo "egress-test: dns-deny (unbound refuses non-allow-listed name) OK" >&2
+
+          echo "egress-test: SUCCESS" >&2
+          exit 0
         ''
       ];
       env = [
@@ -74,7 +109,7 @@ in pkgs.runCommand "test-egress-oci-bundle" {} ''
   mkdir -p $out/rootfs/bin $out/rootfs/tmp
 
   cp ${pkgs.pkgsStatic.busybox}/bin/busybox $out/rootfs/bin/busybox
-  for cmd in sh nc echo cat ls mkdir printf sleep; do
+  for cmd in sh nc echo cat ls mkdir printf sleep nslookup timeout; do
     ln -s busybox $out/rootfs/bin/$cmd
   done
 
