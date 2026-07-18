@@ -21,6 +21,17 @@ enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+const SENSITIVE_COMMAND_FLAGS: &[&str] = &[
+    "--src-creds",
+    "--src-password",
+    "--src-registry-token",
+    "--dest-creds",
+    "--dest-password",
+    "--dest-registry-token",
+    "--registry-password",
+    "--registry-token",
+];
+
 #[derive(Parser)]
 #[command(name = "builder", about = "Build Enclavia enclave images from Docker images")]
 enum Cli {
@@ -164,7 +175,8 @@ struct BuildResult {
 }
 
 async fn run_cmd(cmd: &str, args: &[&str]) -> Result<String> {
-    info!(cmd, ?args, "running command");
+    let logged_args = redact_command_args(args);
+    info!(cmd, args = ?logged_args, "running command");
 
     // Inherit stderr so the child writes directly to our stderr FD. The
     // backend line-streams the builder's stderr into the build log; piping
@@ -187,6 +199,41 @@ async fn run_cmd(cmd: &str, args: &[&str]) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Copy command arguments into a log-safe representation.
+///
+/// Skopeo accepts registry credentials and bearer tokens as either a separate
+/// argument (`--src-creds VALUE`) or an equals-form argument
+/// (`--src-creds=VALUE`). Keep the flag visible for diagnostics but never put
+/// its value into tracing output. The original argument slice is still passed
+/// unchanged to the child process.
+fn redact_command_args(args: &[&str]) -> Vec<String> {
+    let mut redact_next = false;
+    args.iter()
+        .map(|arg| {
+            if redact_next {
+                redact_next = false;
+                return "<redacted>".to_string();
+            }
+
+            if SENSITIVE_COMMAND_FLAGS.contains(arg) {
+                redact_next = true;
+                return (*arg).to_string();
+            }
+
+            for flag in SENSITIVE_COMMAND_FLAGS {
+                if arg
+                    .strip_prefix(flag)
+                    .is_some_and(|suffix| suffix.starts_with('='))
+                {
+                    return format!("{flag}=<redacted>");
+                }
+            }
+
+            (*arg).to_string()
+        })
+        .collect()
 }
 
 /// Pull a Docker image to a local OCI layout using skopeo.
@@ -990,6 +1037,60 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_log_redacts_separate_registry_secret_values() {
+        let args = [
+            "copy",
+            "--src-creds",
+            "alice:hunter2",
+            "--src-registry-token",
+            "signed-bearer-token",
+            "docker://registry.example/app:v1",
+            "oci:/tmp/image:latest",
+        ];
+        assert_eq!(
+            redact_command_args(&args),
+            vec![
+                "copy",
+                "--src-creds",
+                "<redacted>",
+                "--src-registry-token",
+                "<redacted>",
+                "docker://registry.example/app:v1",
+                "oci:/tmp/image:latest",
+            ]
+        );
+    }
+
+    #[test]
+    fn command_log_redacts_equals_form_registry_secret_values() {
+        let args = [
+            "copy",
+            "--src-password=hunter2",
+            "--dest-registry-token=signed-bearer-token",
+        ];
+        assert_eq!(
+            redact_command_args(&args),
+            vec![
+                "copy",
+                "--src-password=<redacted>",
+                "--dest-registry-token=<redacted>",
+            ]
+        );
+    }
+
+    #[test]
+    fn command_log_preserves_non_secret_arguments() {
+        let args = [
+            "build",
+            "path:/builder#enclave",
+            "--override-input",
+            "oci-bundle",
+            "path:/tmp/bundle",
+        ];
+        assert_eq!(redact_command_args(&args), args.map(String::from));
+    }
 
     #[test]
     fn image_digest_accepts_canonical_sha256() {
