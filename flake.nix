@@ -38,11 +38,10 @@
     # Override during local development with
     # `--override-input enclavia path:../enclavia`.
     enclavia = {
-      # Pinned to EnclaviaIO/enclavia master after #52
-      # (secrets-init --mode aws-creds), the in-enclave creds sink that
-      # init.sh's AWS-creds boot pass dials on vsock 5013. Re-bump when a
-      # newer in-enclave change is needed.
-      url = "github:EnclaviaIO/enclavia/2c2341a6fe8241b08f3dff7dc40d544bf2c41a1e";
+      # Pinned to EnclaviaIO/enclavia master after #76, which builds the
+      # customer-enclave binaries as fully static musl executables. This
+      # avoids pulling glibc and libgcc into the measured initramfs.
+      url = "github:EnclaviaIO/enclavia/b414ec0334594b390b98c1157cd1cc2537827e28";
     };
   };
 
