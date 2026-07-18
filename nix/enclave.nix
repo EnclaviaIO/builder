@@ -131,8 +131,12 @@ let
       doInstallCheck = false;
     });
 
-  rootfs = pkgs.runCommand "enclave-rootfs" {
+  runtimeRootfs = pkgs.runCommand "enclave-runtime-rootfs" {
     nativeBuildInputs = [ pkgs.nukeReferences ];
+    # Everything supplied by the builder is self-contained. Keep this
+    # invariant machine-checked so a newly copied dynamic binary cannot
+    # silently reintroduce its Nix closure into the EIF.
+    allowedReferences = [ ];
   } ''
     mkdir -p $out/bin $out/etc/enclavia $out/etc/unbound $out/var/lib/oci
 
@@ -285,26 +289,49 @@ let
     cp ${bundleEgressAllowlist} $out/etc/enclavia/egress.json
     '' else ""}
 
-    # OCI bundle (customer's image)
-    cp -r ${ociBundlePath} $out/var/lib/oci/bundle
-
-    # The static tool binaries embed /nix/store path *strings* (configure
-    # defaults, package metadata) they never dereference at runtime:
-    # everything they need is either linked in or passed explicitly by
-    # init.sh (unbound gets -c, jq/busybox/cryptsetup take no config).
-    # Left in place, each string would pull that store path -- and its
-    # transitive closure -- into the measured initramfs via the
-    # closure-packing step below. Scrub them. The enclavia Rust binaries
-    # are deliberately NOT scrubbed: if they are dynamically linked their
-    # glibc references are load-bearing (ELF interpreter), and the
-    # closure step must see them.
-    for tool in crun busybox jq unbound cryptsetup mkfs.btrfs blkid; do
+    # Every binary in this list is static (the Enclavia services target
+    # musl; the remaining tools come from pkgsStatic). They can still
+    # embed inert /nix/store strings in build metadata and configure-time
+    # defaults, so scrub those strings. Keep the list explicit: adding a
+    # binary requires confirming that it is self-contained before opting
+    # it into this destructive operation. allowedReferences above turns
+    # an omission into a build failure.
+    for tool in \
+      enclavia-server \
+      enclavia-secrets-init \
+      enclavia-chain-init \
+      enclavia-nbd-client \
+      enclavia-crypto \
+      enclavia-egress \
+      crun \
+      busybox \
+      jq \
+      unbound \
+      cryptsetup \
+      mkfs.btrfs \
+      blkid \
+      iproute2-ip \
+      xtables-legacy-multi
+    do
       if [ -f "$out/bin/$tool" ]; then
-        chmod +w "$out/bin/$tool"
+        chmod u+w "$out/bin/$tool"
         nuke-refs "$out/bin/$tool"
-        chmod -w "$out/bin/$tool"
+        chmod a-w "$out/bin/$tool"
       fi
     done
+  '';
+
+  # Keep the customer OCI bundle separate from the zero-reference runtime
+  # assertion above. A Nix-built workload may intentionally carry dynamic
+  # libraries at /nix/store paths inside its own container rootfs (as the
+  # WS test fixture does); those references are self-contained within the
+  # bundle and must not cause the same closure to be copied into the outer
+  # initramfs. The EIF therefore receives this assembled tree directly,
+  # with copyToRootWithClosure disabled below.
+  rootfs = pkgs.runCommand "enclave-rootfs" {} ''
+    mkdir -p $out
+    cp -r ${runtimeRootfs}/. $out/
+    cp -r ${ociBundlePath} $out/var/lib/oci/bundle
   '';
 
   # Always the patched init (never AWS's stock CID-3-only blob init), so a
@@ -317,25 +344,6 @@ let
   # drives debug-attestation trust anchors in config.json.)
   initBinary = "${patchedInit}/bin/init";
 
-  # Rootfs plus the /nix/store closure the dynamically-linked binaries
-  # need at runtime (glibc + libgcc for the Rust in-enclave binaries).
-  # nitro-util's `copyToRootWithClosure = true` would do this for us,
-  # BUT its closure necessarily contains the rootfs derivation itself,
-  # so every byte of the rootfs -- including the whole customer OCI
-  # bundle -- used to be shipped twice: once at `/` and once under
-  # `/nix/store/...-enclave-rootfs/`. Nothing at runtime looks at the
-  # store copy (init.sh and the entrypoint only use the `/` layout), so
-  # pack the closure ourselves and skip the self-reference.
-  rootfsWithClosure = pkgs.runCommand "enclave-rootfs-with-closure" {} ''
-    mkdir -p $out/nix/store
-    for p in $(cat ${pkgs.closureInfo { rootPaths = [ rootfs ]; }}/store-paths); do
-      if [ "$p" != "${rootfs}" ]; then
-        cp -r $p $out/nix/store/
-      fi
-    done
-    cp -r ${rootfs}/* $out/
-  '';
-
 in
   nitroLib.buildEif {
     name = "enclavia-enclave";
@@ -347,7 +355,7 @@ in
       else blobs.kernelConfig;
     # Modern kernels (6.x+) have the NSM guest driver built-in
     nsmKo = if customKernel != null then null else blobs.nsmKo;
-    copyToRoot = rootfsWithClosure;
+    copyToRoot = rootfs;
     copyToRootWithClosure = false;
     entrypoint = "/bin/enclave-init";
     init = initBinary;
