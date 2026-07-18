@@ -202,11 +202,24 @@ async fn pull_image(
     dest: &Path,
     creds: Option<(&str, &str)>,
     registry_token: Option<&str>,
+    image_digest: Option<&str>,
 ) -> Result<()> {
-    let src = format!("docker://{image}");
+    let source_image = image_reference_for_pull(image, image_digest);
+    let src = format!("docker://{source_image}");
     let dst = format!("oci:{}:latest", dest.display());
 
-    let mut args = vec!["copy", &src, &dst];
+    // EIFs currently boot an x86_64 Linux kernel. Select that platform
+    // explicitly so a multi-arch tag/index cannot resolve according to the
+    // builder host (for example arm64 on an Apple Silicon development host).
+    let mut args = vec![
+        "copy",
+        "--override-os",
+        "linux",
+        "--override-arch",
+        "amd64",
+        &src,
+        &dst,
+    ];
 
     // Disable TLS verification for localhost registries (dev/test).
     if image.starts_with("localhost:") || image.starts_with("127.0.0.1:") {
@@ -226,6 +239,32 @@ async fn pull_image(
     run_cmd("skopeo", &args).await?;
     info!(image, "image pulled successfully");
     Ok(())
+}
+
+/// Return the registry reference skopeo should pull.
+///
+/// When the caller supplies the manifest digest recorded by the backend, put
+/// it directly in the source reference. The registry transport then fetches
+/// and content-verifies that digest instead of resolving a mutable tag while
+/// the same (otherwise unrelated) digest is merely stamped into the EIF.
+/// Skopeo does not accept a source reference containing both a tag and digest,
+/// so remove an image tag before appending `@sha256:...`. A colon belonging to
+/// the registry port is retained. Replace an existing digest rather than
+/// producing two `@` components.
+fn image_reference_for_pull(image: &str, image_digest: Option<&str>) -> String {
+    match image_digest {
+        Some(digest) => {
+            let name_and_tag = image.split_once('@').map_or(image, |(name, _)| name);
+            let last_slash = name_and_tag.rfind('/');
+            let repository = match (name_and_tag.rfind(':'), last_slash) {
+                (Some(colon), Some(slash)) if colon > slash => &name_and_tag[..colon],
+                (Some(colon), None) => &name_and_tag[..colon],
+                _ => name_and_tag,
+            };
+            format!("{repository}@{digest}")
+        }
+        None => image.to_string(),
+    }
 }
 
 /// Unpack an OCI image into an OCI runtime bundle using umoci.
@@ -615,9 +654,9 @@ fn validate_control_pubkey(b64: &str) -> std::result::Result<(), String> {
 /// manifest digest is the canonical `sha256:[0-9a-f]{64}` form; we accept
 /// only that prefix and the right hex length. Refusing anything else
 /// keeps a malformed digest from getting baked into the EIF where it
-/// would surface as a chain-validation failure later. We do not verify
-/// the digest matches the image content (that's the registry's job), and
-/// the in-enclave chain-init relays whatever the backend supplied here.
+/// would surface as a chain-validation failure later. When present, the
+/// digest is also used as the skopeo source reference, so the registry
+/// transport content-verifies the same manifest that we stamp into the EIF.
 fn validate_image_digest(s: &str) -> std::result::Result<(), String> {
     let rest = s
         .strip_prefix("sha256:")
@@ -822,7 +861,7 @@ async fn build(
 
     // 1. Pull the Docker image
     info!(image, "pulling image");
-    pull_image(image, &oci_layout, creds, registry_token).await?;
+    pull_image(image, &oci_layout, creds, registry_token, image_digest).await?;
 
     // 2. Unpack into OCI bundle
     info!("unpacking OCI bundle");
@@ -1023,6 +1062,45 @@ mod tests {
     fn image_digest_rejects_non_hex() {
         let d = format!("sha256:{}", "g".repeat(64));
         assert!(validate_image_digest(&d).is_err());
+    }
+
+    #[test]
+    fn image_reference_without_digest_keeps_original_reference() {
+        assert_eq!(
+            image_reference_for_pull("registry.example/app:latest", None),
+            "registry.example/app:latest"
+        );
+    }
+
+    #[test]
+    fn image_reference_with_digest_pins_tagged_image() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(
+            image_reference_for_pull("registry.example:5000/team/app:v1", Some(&digest)),
+            format!("registry.example:5000/team/app@{digest}")
+        );
+    }
+
+    #[test]
+    fn image_reference_with_digest_preserves_registry_port() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(
+            image_reference_for_pull("registry.example:5000/team/app", Some(&digest)),
+            format!("registry.example:5000/team/app@{digest}")
+        );
+    }
+
+    #[test]
+    fn image_reference_with_digest_replaces_existing_digest() {
+        let old_digest = format!("sha256:{}", "1".repeat(64));
+        let new_digest = format!("sha256:{}", "2".repeat(64));
+        assert_eq!(
+            image_reference_for_pull(
+                &format!("registry.example/app@{old_digest}"),
+                Some(&new_digest)
+            ),
+            format!("registry.example/app@{new_digest}")
+        );
     }
 
     // --- synchronizer trust anchors (enclavia#208) ----------------------
