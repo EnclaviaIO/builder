@@ -37,7 +37,9 @@ nix run .#test-debug-vm --override-input enclavia-server path:../enclavia-server
 ### Custom enclave (from a Docker image)
 
 ```bash
-# 1. Build the enclave from an OCI bundle
+# 1. Build the enclave from an OCI bundle (a raw bundle directory is accepted
+#    here as a development convenience and deterministically archived by the
+#    flake; production uses the builder-generated bundle.tar input)
 nix build .#enclave \
   --override-input enclavia-server path:../enclavia-server \
   --override-input oci-bundle path:/path/to/your/bundle

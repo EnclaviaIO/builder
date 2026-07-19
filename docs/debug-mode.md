@@ -138,11 +138,12 @@ addressed in `patch_bundle_config` in `src/main.rs`:
 
 Several smaller patches travel with these for the same reason (no
 namespaces means no devpts, no UTS hostname, no per-container mounts):
-`process.terminal` is forced to false, the hostname is dropped, all
-mounts are stripped (the init script pre-mounts proc, dev, sys, tmp
-into the initramfs root), and a full set of capabilities is granted to
-the container so root inside it can write to files owned by the original
-build user.
+`process.terminal` is forced to false, the hostname is dropped, and all
+mounts are stripped (the init script pre-mounts proc, dev, sys, tmp into the
+initramfs root). The image's capability sets are otherwise left intact. OCI
+ownership now survives the deterministic tar-to-cpio handoff, so the builder
+no longer expands every capability set merely to compensate for files owned
+by the build user.
 
 ## Test wrappers
 

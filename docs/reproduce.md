@@ -46,25 +46,32 @@ content-addressed:
 
 - **The egress allowlist JSON.** The user-supplied document is stored
   verbatim on the row (`e.egress_allowlist`). At build time the
-  builder writes it into the OCI bundle and `enclave.nix` places it
-  at `/etc/enclavia/egress.json` in the rootfs. Changing it changes
-  PCR2.
+  builder stages it at `/etc/enclavia/egress.json` in the archived
+  rootfs payload. Changing it changes PCR2.
 
 - **The storage configuration** (size, mount point). Same story as
   the egress allowlist: it lives on the row and is baked into
   `enclavia-config.json`.
 
-The OCI bundle itself is the one path-input that needs explicit
-deterministic packaging. `nix build` ingests it via
-`--override-input oci-bundle path:<dir>`, and the `path:` narHash folds
-in both file content and mtimes. `umoci unpack`, the OCI-config patch
-step, and the per-build write of `enclavia-config.json` all create
-files with the host's current time, which would otherwise propagate
-through the rootfs hash and into PCR0 / PCR2. The builder normalises
-this in `normalize_bundle_for_nix`: every mtime/atime is reset to the
-Unix epoch, and `umoci`'s per-host bookkeeping files (`umoci.json`,
-`sha256_*.mtree`) are removed. See [builder#10](https://github.com/EnclaviaIO/builder/issues/10)
-for the history.
+The OCI bundle is passed across the Nix boundary as a deterministic,
+uncompressed tar archive rather than as an unpacked path. After patching the
+runtime bundle, the builder removes umoci's per-host bookkeeping
+(`umoci.json`, `sha256_*.mtree`) and asks umoci to serialize the final payload
+with `SOURCE_DATE_EPOCH=1`. That serializer understands umoci's rootless
+ownership marker, so tar headers contain the container UID/GID rather than the
+build user's IDs; it also retains hardlinks, complete mode bits, and supported
+xattrs. The flake input directory contains only `bundle.tar`, making the NAR
+hash a hash of opaque archive bytes.
+
+`enclave.nix` converts that tar directly to the final Linux `newc` archive and
+appends it as the last user ramdisk. There is no unpacked Nix store output in
+between. The direct conversion retains the metadata fields representable by
+initramfs (`mode`, UID/GID, inode/link identity, and device numbers). Linux's
+[`newc` initramfs format](https://www.kernel.org/doc/html/latest/driver-api/early-userspace/buffer-format.html)
+has no xattr or ACL fields, so those remain in the transport tar but cannot be
+represented by the current initramfs format. See
+[builder#10](https://github.com/EnclaviaIO/builder/issues/10) for the original
+reproducibility history.
 
 The kernel and init blobs come from `nitro-util/blobs/x86_64/` (Linux
 4.14 for the base EIF, plus our `linuxManualConfig` kernel build for
@@ -86,9 +93,9 @@ same blobs.
    `nix build path:<builder-rev>#<eif-name>` (where `<eif-name>` is
    `enclave` or `enclave-storage` depending on the row), passing
    `--override-input enclavia-crates path:<crates-rev>` and, for the
-   image input, an OCI bundle produced from the pinned digest. The
-   builder binary is the same one the backend ran, just driven by the
-   CLI.
+   image input, a deterministic OCI payload archive produced from the
+   pinned digest. The builder binary is the same one the backend ran,
+   just driven by the CLI.
 
 3. **Compare PCRs.** The local rebuild produces a `pcr.json` next to
    the EIF. The CLI compares that against the PCRs the backend
@@ -111,10 +118,9 @@ notice that the egress posture has changed.
 
 ## Known limits
 
-- **The OCI bundle normalisation is best-effort.** Any image-format
-  feature that the builder does not understand could in principle
-  introduce nondeterminism that survives the mtime + bookkeeping
-  reset. We have not seen one in practice, but the long tail is open.
+- **Initramfs cannot carry xattrs or ACLs.** The deterministic tar preserves
+  them across Nix, but Linux's `newc` archive has no fields for them. A future
+  rootfs format would be needed to expose them inside the enclave.
 
 - **`flake.lock` revs are only as good as the deployment's discipline.**
   The backend stamps whatever its own `flake.lock` says at startup.

@@ -62,9 +62,10 @@ calling process can consume them directly.
 
 - `nix build .#builder`: the `builder` Rust binary itself.
 - `nix build .#enclave[-debug]` / `.#enclave-storage[-debug]`: build an
-  EIF from an OCI bundle. The bundle is supplied via
-  `--override-input oci-bundle path:<dir>`; production callers go
-  through the `builder` CLI rather than invoking the flake directly.
+  EIF from a deterministic OCI payload archive. The archive is supplied as
+  `bundle.tar` inside the directory passed via
+  `--override-input oci-bundle path:<archive-input-dir>`; production callers
+  go through the `builder` CLI rather than invoking the flake directly.
 - `nix build .#test-debug-vm`: a wrapper that launches a minimal
   busybox-HTTP test enclave under QEMU with vhost-device-vsock
   stitched in. Used by the router e2e tests.
