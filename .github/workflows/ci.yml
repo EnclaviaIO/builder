@@ -20,7 +20,7 @@ jobs:
   # (postInstall makeWrapper) and the whole point of this workflow is to
   # catch that before it lands on master again.
   check:
-    name: build / clippy / test / nix build
+    name: build / clippy / test / nix / rootfs size
     runs-on: [self-hosted, nix]
     timeout-minutes: 60
 
@@ -50,3 +50,33 @@ jobs:
       # the moment that wrap drops — we don't want to find out from a user.
       - name: nix build .#builder
         run: nix build .#builder
+
+      # Build only the uncompressed rootfs trees, not their kernels or EIFs.
+      # Each check emits a stable per-path manifest and fails if the
+      # builder-owned base/storage overhead exceeds its byte budget.
+      - name: Check uncompressed rootfs size budgets
+        run: |
+          check_rootfs_size() {
+            variant="$1"
+            result_link="result-rootfs-size-$variant"
+
+            nix build \
+              ".#checks.x86_64-linux.rootfs-size-$variant" \
+              --out-link "$result_link" \
+              --print-build-logs
+
+            echo "::group::$variant rootfs size manifest"
+            cat "$result_link/rootfs-size-summary.tsv"
+            cat "$result_link/rootfs-size-manifest.tsv"
+            echo "::endgroup::"
+
+            {
+              echo "### $variant rootfs size"
+              echo '```tsv'
+              cat "$result_link/rootfs-size-summary.tsv"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          check_rootfs_size base
+          check_rootfs_size storage

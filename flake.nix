@@ -159,6 +159,43 @@
           customKernel = storageKernel;
         };
 
+        # --- Uncompressed rootfs size budgets -------------------------
+        # Measure the builder-owned overhead with the deliberately empty
+        # dummy OCI bundle. Customer images are arbitrary in size and are
+        # therefore outside this budget. rootfsOnly also avoids compiling
+        # the storage kernel or assembling an EIF merely to count bytes.
+        baseRootfsForSizeCheck = pkgs.callPackage ./nix/enclave.nix {
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
+          ociBundlePath = oci-bundle;
+          rootfsOnly = true;
+        };
+
+        storageRootfsForSizeCheck = pkgs.callPackage ./nix/enclave.nix {
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
+          ociBundlePath = oci-bundle;
+          storageEnabled = true;
+          rootfsOnly = true;
+        };
+
+        # Leave room for ordinary dependency-size drift while remaining
+        # tight enough to catch a glibc closure, a duplicated runtime tree,
+        # or another multi-megabyte packaging regression. Raising either
+        # limit should require reviewing the emitted per-path manifest.
+        baseRootfsSizeBudget = 64 * 1024 * 1024;
+        storageRootfsSizeBudget = 96 * 1024 * 1024;
+
+        baseRootfsSizeCheck = pkgs.callPackage ./nix/rootfs-size-check.nix {
+          name = "base";
+          rootfs = baseRootfsForSizeCheck;
+          maxBytes = baseRootfsSizeBudget;
+        };
+
+        storageRootfsSizeCheck = pkgs.callPackage ./nix/rootfs-size-check.nix {
+          name = "storage";
+          rootfs = storageRootfsForSizeCheck;
+          maxBytes = storageRootfsSizeBudget;
+        };
+
         # --- Debug VM launcher ---
         # Wraps the EIF with a script that launches QEMU nitro-enclave locally.
         # Handles vhost-device-vsock setup and heartbeat responding.
@@ -887,6 +924,11 @@
 
       in
       {
+        checks = {
+          rootfs-size-base = baseRootfsSizeCheck;
+          rootfs-size-storage = storageRootfsSizeCheck;
+        };
+
         packages = {
           inherit builder enclave enclave-debug enclave-storage enclave-storage-debug debug-vm test-bundle test-enclave test-enclave-debug test-debug-vm test-storage-bundle test-enclave-storage-debug test-enclave-storage-debug-no-luks test-storage-vm test-egress-bundle test-enclave-egress-debug test-egress-vm test-ws-bundle test-enclave-ws-debug test-secrets-bundle test-enclave-secrets-debug test-secrets-vm;
           default = builder;

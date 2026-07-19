@@ -18,6 +18,9 @@
   enclaviaChainInitPkg ? null,
   storageEnabled ? false,
   customKernel ? null,
+  # CI size checks need the assembled, uncompressed rootfs without paying
+  # to build the kernel, ramdisks, or final EIF.
+  rootfsOnly ? false,
   # Diagnostic: skip LUKS and mount raw btrfs on the NBD device directly.
   # Used to isolate proxy throughput from cryptsetup overhead during testing.
   skipLuks ? false,
@@ -345,7 +348,7 @@ let
   initBinary = "${patchedInit}/bin/init";
 
 in
-  nitroLib.buildEif {
+  if rootfsOnly then rootfs else nitroLib.buildEif {
     name = "enclavia-enclave";
     kernel = if customKernel != null
       then "${customKernel}/bzImage"
