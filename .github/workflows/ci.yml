@@ -51,6 +51,11 @@ jobs:
       - name: nix build .#builder
         run: nix build .#builder
 
+      # Exercise the archive-to-cpio boundary with synthetic non-root
+      # ownership, setuid mode bits, hardlinks, symlinks, and a device node.
+      - name: Check OCI metadata archive conversion
+        run: nix build .#checks.x86_64-linux.oci-metadata --print-build-logs
+
       # Build only the uncompressed rootfs trees, not their kernels or EIFs.
       # Each check emits a stable per-path manifest and fails if the
       # builder-owned base/storage overhead exceeds its byte budget.
