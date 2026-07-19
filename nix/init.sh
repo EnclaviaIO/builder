@@ -570,10 +570,19 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
         if ! /bin/cryptsetup isLuks /dev/nbd0 2>/dev/null; then
             /bin/cryptsetup luksFormat \
                 --batch-mode \
+                --type luks2 \
+                --cipher aes-xts-plain64 \
+                --key-size 512 \
                 --key-file /tmp/luks.key \
                 /dev/nbd0
         fi
-        /bin/cryptsetup luksOpen --key-file /tmp/luks.key /dev/nbd0 encdata
+        # Keep the volume key on dm-crypt's direct key path.  The enclave
+        # kernel deliberately omits CONFIG_KEYS; without this flag cryptsetup
+        # may try to upload a LUKS2 volume key to a kernel keyring first.
+        /bin/cryptsetup luksOpen \
+            --disable-keyring \
+            --key-file /tmp/luks.key \
+            /dev/nbd0 encdata
 
         # Remove plaintext key — must not be accessible to customer code.
         # The upgrade flow re-decrypts via KMS rather than reading this file.

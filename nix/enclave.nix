@@ -23,7 +23,10 @@
   # may skip it, but every real-enclave variant passes it in.
   enclaviaChainInitPkg ? null,
   storageEnabled ? false,
-  customKernel ? null,
+  # Required for every EIF: the retired nitro-util Linux 4.14 blob is not a
+  # fallback. Base and storage callers pass separate minimal profiles built
+  # from the same maintained, lockfile-pinned kernel source.
+  customKernel,
   # CI size checks need the builder-owned, uncompressed runtime rootfs without
   # paying to build the customer payload ramdisk, kernel, or final EIF.
   rootfsOnly ? false,
@@ -33,9 +36,6 @@
 }:
 
 let
-  arch = "x86_64";
-  blobs = nitroLib.blobs.${arch};
-
   # libbsd's explicit_bzero check aborts intermittently when the static
   # (musl) variant is built from source on some build hosts; the library
   # itself is unaffected. Skip its test suite in the static package set
@@ -246,7 +246,7 @@ let
     cp ${pkgsStatic.iproute2}/bin/ip $out/bin/iproute2-ip
 
     # Static legacy iptables (xtables-legacy backend; the enclave
-    # kernel builds CONFIG_IP_NF_IPTABLES/FILTER, not nf_tables). One
+    # kernel builds CONFIG_IP_NF_IPTABLES_LEGACY/FILTER, not nf_tables). One
     # boot-time OUTPUT rule stops a workload forging the isolated
     # resolver's source address with CAP_NET_RAW (resolver-bypass
     # hardening). The
@@ -351,17 +351,13 @@ let
       | gzip -n > $out
   '';
 
-  kernel = if customKernel != null
-    then "${customKernel}/bzImage"
-    else blobs.kernel;
-  kernelConfig = if customKernel != null
-    then customKernel.configfile
-    else blobs.kernelConfig;
-  # Modern kernels (6.x+) have the NSM guest driver built-in.
-  nsmKo = if customKernel != null then null else blobs.nsmKo;
+  kernel = "${customKernel}/bzImage";
+  kernelConfig = customKernel.configfile;
+  # The maintained kernel has the NSM guest driver built in. Shipping the old
+  # out-of-tree module would be redundant and would mismatch the kernel.
   systemRamdisk = nitroLib.mkSysRamdisk {
     init = initBinary;
-    inherit nsmKo;
+    nsmKo = null;
   };
 
 in

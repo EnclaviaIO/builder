@@ -160,20 +160,68 @@
         # at boot to talk to mock-kms.
         testKmsKeyId = "test-key-001";
 
-        # Custom kernel with NBD block device support for storage-enabled enclaves.
-        # Based on the minimal AWS nitro kernel config (~1000 options) with
-        # CONFIG_BLK_DEV_NBD=y and CONFIG_NSM=y added, adapted to a modern
-        # kernel source via `make oldconfig`.
-        storageKernel = pkgs.linuxManualConfig {
-          version = pkgs.linuxPackages_latest.kernel.version;
-          src = pkgs.linuxPackages_latest.kernel.src;
-          configfile = ./nix/enclave-kernel.config;
-          allowImportFromDerivation = true;
+        # Both EIF profiles use the maintained kernel pinned by nixpkgs.  A
+        # small KCONFIG_ALLCONFIG seed is resolved with allnoconfig first, so
+        # advancing nixpkgs cannot silently add new default-y kernel features.
+        kernelSource = pkgs.linuxPackages_latest.kernel;
+        enclaveKernelConfig = pkgs.callPackage ./nix/kernel-config.nix {
+          kernel = kernelSource;
+        };
+        storageKernelConfig = pkgs.callPackage ./nix/kernel-config.nix {
+          kernel = kernelSource;
+          storage = true;
+        };
+
+        mkEnclaveKernel = { config, kernelPatches ? [] }:
+          pkgs.linuxManualConfig {
+            version = kernelSource.version;
+            src = kernelSource.src;
+            configfile = "${config}/config";
+            allowImportFromDerivation = true;
+            inherit kernelPatches;
+          };
+
+        enclaveKernel = mkEnclaveKernel {
+          config = enclaveKernelConfig;
+        };
+
+        storageKernel = mkEnclaveKernel {
+          config = storageKernelConfig;
           kernelPatches = [{
             name = "nbd-vsock-support";
             patch = ./nix/nbd-vsock.patch;
           }];
         };
+
+        # Builds the two bzImages and representative EIFs, then records their
+        # byte sizes alongside the retired Linux 4.14 non-storage blob.
+        # Storage's before/after comparison requires a separate build of the
+        # earlier worktree; see docs/kernel.md.
+        kernelSizeReport = pkgs.runCommand "enclavia-kernel-size-report" {} ''
+          mkdir "$out"
+          legacy_bytes=$(${pkgs.coreutils}/bin/stat -c %s ${nitroLib.blobs.x86_64.kernel})
+          legacy_built_ins=$(${pkgs.gawk}/bin/awk -F= '$2 == "y" { count++ } END { print count + 0 }' ${nitroLib.blobs.x86_64.kernelConfig})
+          legacy_modules=$(${pkgs.gawk}/bin/awk -F= '$2 == "m" { count++ } END { print count + 0 }' ${nitroLib.blobs.x86_64.kernelConfig})
+          base_bytes=$(${pkgs.coreutils}/bin/stat -c %s ${enclaveKernel}/bzImage)
+          storage_bytes=$(${pkgs.coreutils}/bin/stat -c %s ${storageKernel}/bzImage)
+          base_eif_bytes=$(${pkgs.coreutils}/bin/stat -c %s ${test-enclave}/image.eif)
+          storage_eif_bytes=$(${pkgs.coreutils}/bin/stat -c %s ${test-enclave-storage-debug}/image.eif)
+          base_reduction=$((legacy_bytes - base_bytes))
+          base_percent=$((base_reduction * 100 / legacy_bytes))
+          {
+            echo "legacy-linux-4.14-bzimage-bytes=$legacy_bytes"
+            echo "legacy-linux-4.14-built-in-options=$legacy_built_ins"
+            echo "legacy-linux-4.14-module-options=$legacy_modules"
+            echo "base-bzimage-bytes=$base_bytes"
+            echo "base-vs-legacy-reduction-bytes=$base_reduction"
+            echo "base-vs-legacy-reduction-percent=$base_percent"
+            echo "storage-bzimage-bytes=$storage_bytes"
+            echo "base-test-eif-bytes=$base_eif_bytes"
+            echo "storage-test-eif-bytes=$storage_eif_bytes"
+          } > "$out/report"
+          cp ${enclaveKernelConfig}/report "$out/base-config-report"
+          cp ${storageKernelConfig}/report "$out/storage-config-report"
+        '';
 
         # Keep the production feature matrix in one recipe. The unsuffixed
         # targets are deny-all and contain no egress stack; `-egress` targets
@@ -187,7 +235,7 @@
           inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
           inherit ociBundleArchive debugMode storageEnabled egressEnabled rootfsOnly;
           enclaviaEgressPkg = if egressEnabled then enclaviaEgressPkg else null;
-          customKernel = if storageEnabled then storageKernel else null;
+          customKernel = if storageEnabled then storageKernel else enclaveKernel;
         };
 
         enclave = mkProductionEnclave { };
@@ -354,6 +402,7 @@
         test-enclave = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg;
           ociBundleArchive = testBundleArchive;
+          customKernel = enclaveKernel;
         };
 
         # Note: deliberately does NOT pass `enclaviaChainInitPkg`. The
@@ -373,6 +422,7 @@
           inherit pkgs nitroLib enclaviaServerPkg;
           ociBundleArchive = testBundleArchive;
           debugMode = true;
+          customKernel = enclaveKernel;
         };
 
         # --- WS test bundle + enclave ---
@@ -393,6 +443,7 @@
           inherit pkgs nitroLib enclaviaServerPkg;
           ociBundleArchive = testWsBundleArchive;
           debugMode = true;
+          customKernel = enclaveKernel;
         };
 
         # --- Egress test bundle + enclave ---
@@ -407,6 +458,7 @@
           ociBundleArchive = testEgressBundleArchive;
           debugMode = true;
           egressEnabled = true;
+          customKernel = enclaveKernel;
         };
 
         # --- Secrets test bundle + enclave (#169) ---
@@ -423,6 +475,7 @@
           inherit pkgs nitroLib enclaviaServerPkg enclaviaSecretsInitPkg;
           ociBundleArchive = testSecretsBundleArchive;
           debugMode = true;
+          customKernel = enclaveKernel;
         };
 
         # --- Storage test bundle + enclave ---
@@ -1024,6 +1077,11 @@
 
         packages = {
           inherit builder enclave enclave-debug enclave-egress enclave-egress-debug enclave-storage enclave-storage-debug enclave-storage-egress enclave-storage-egress-debug debug-vm test-bundle test-enclave test-enclave-debug test-debug-vm test-storage-bundle test-enclave-storage-debug test-enclave-storage-debug-no-luks test-storage-vm test-egress-bundle test-enclave-egress-debug test-egress-vm test-ws-bundle test-enclave-ws-debug test-secrets-bundle test-enclave-secrets-debug test-secrets-vm;
+          enclave-kernel = enclaveKernel;
+          enclave-storage-kernel = storageKernel;
+          enclave-kernel-config = enclaveKernelConfig;
+          enclave-storage-kernel-config = storageKernelConfig;
+          kernel-size-report = kernelSizeReport;
           default = builder;
         };
 
