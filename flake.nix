@@ -16,8 +16,9 @@
       # Don't follow our nixpkgs — nitro-util's Go builds break with newer nixpkgs
     };
 
-    # Placeholder — override at build time:
-    #   --override-input oci-bundle path:/path/to/bundle
+    # Placeholder — the builder overrides this with a directory containing
+    # `bundle.tar`, its deterministic OCI payload archive.
+    #   --override-input oci-bundle path:/path/to/archive-input
     oci-bundle = {
       url = "path:./dummy-bundle";
       flake = false;
@@ -113,6 +114,47 @@
         mockKmsPkg = enclavia.packages.${system}.mock-kms;
         nitroLib = nitro-util.lib.${system};
 
+        # In-tree fixtures are ordinary Nix-built bundle directories. Package
+        # them with the same rootfs-relative shape consumed by enclave.nix.
+        # Production does not use this helper: the Rust builder supplies an
+        # umoci-generated tar which retains the customer's original metadata.
+        mkOciBundleArchive = name: bundle: pkgs.runCommand "${name}-payload.tar" {
+          nativeBuildInputs = [ pkgs.gnutar pkgs.coreutils ];
+        } ''
+          set -euo pipefail
+          mkdir -p staging/rootfs/var/lib/oci staging/rootfs/etc/enclavia
+          chmod 0755 staging staging/rootfs staging/rootfs/var \
+            staging/rootfs/var/lib staging/rootfs/var/lib/oci \
+            staging/rootfs/etc staging/rootfs/etc/enclavia
+          cp -a ${bundle} staging/rootfs/var/lib/oci/bundle
+          if [ -f ${bundle}/enclavia-config.json ]; then
+            cp ${bundle}/enclavia-config.json staging/rootfs/etc/enclavia/config.json
+            chmod 0644 staging/rootfs/etc/enclavia/config.json
+          fi
+          if [ -f ${bundle}/egress.json ]; then
+            cp ${bundle}/egress.json staging/rootfs/etc/enclavia/egress.json
+            chmod 0644 staging/rootfs/etc/enclavia/egress.json
+          fi
+          tar \
+            --create \
+            --file=$out \
+            --format=posix \
+            --sort=name \
+            --mtime=@1 \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            --pax-option=delete=atime,delete=ctime \
+            --xattrs \
+            --directory=staging \
+            rootfs
+        '';
+
+        suppliedBundleArchive = oci-bundle + "/bundle.tar";
+        ociBundleArchive = if builtins.pathExists suppliedBundleArchive
+          then suppliedBundleArchive
+          else mkOciBundleArchive "placeholder-oci-bundle" oci-bundle;
+
         # Test KMS key ID seeded into the bootstrap blob (first 4KB of the
         # backing file) by test-storage-vm. enclavia-crypto reads it from there
         # at boot to talk to mock-kms.
@@ -135,44 +177,44 @@
 
         enclave = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
-          ociBundlePath = oci-bundle;
+          inherit ociBundleArchive;
         };
 
         enclave-debug = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
-          ociBundlePath = oci-bundle;
+          inherit ociBundleArchive;
           debugMode = true;
         };
 
         enclave-storage = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
-          ociBundlePath = oci-bundle;
+          inherit ociBundleArchive;
           storageEnabled = true;
           customKernel = storageKernel;
         };
 
         enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
-          ociBundlePath = oci-bundle;
+          inherit ociBundleArchive;
           debugMode = true;
           storageEnabled = true;
           customKernel = storageKernel;
         };
 
         # --- Uncompressed rootfs size budgets -------------------------
-        # Measure the builder-owned overhead with the deliberately empty
-        # dummy OCI bundle. Customer images are arbitrary in size and are
-        # therefore outside this budget. rootfsOnly also avoids compiling
-        # the storage kernel or assembling an EIF merely to count bytes.
+        # Measure only builder-owned runtime overhead. Customer payloads are
+        # arbitrary in size and live in their own ramdisk, outside this budget.
+        # rootfsOnly also avoids compiling the storage kernel or assembling an
+        # EIF merely to count bytes.
         baseRootfsForSizeCheck = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
-          ociBundlePath = oci-bundle;
+          inherit ociBundleArchive;
           rootfsOnly = true;
         };
 
         storageRootfsForSizeCheck = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
-          ociBundlePath = oci-bundle;
+          inherit ociBundleArchive;
           storageEnabled = true;
           rootfsOnly = true;
         };
@@ -195,6 +237,14 @@
           rootfs = storageRootfsForSizeCheck;
           maxBytes = storageRootfsSizeBudget;
         };
+
+        ociMetadataCheck = pkgs.runCommand "oci-tar-to-cpio-metadata-check" {
+          nativeBuildInputs = [ pkgs.python3 ];
+        } ''
+          TAR_TO_CPIO=${./nix/tar-to-cpio.py} \
+            python3 ${./nix/test_tar_to_cpio.py}
+          touch $out
+        '';
 
         # --- Debug VM launcher ---
         # Wraps the EIF with a script that launches QEMU nitro-enclave locally.
@@ -264,10 +314,11 @@
         # --- Test bundle + enclave ---
         # Minimal OCI bundle with a busybox hello-world HTTP server for testing.
         test-bundle = pkgs.callPackage ./nix/test-bundle.nix { inherit pkgs; };
+        testBundleArchive = mkOciBundleArchive "test-oci-bundle" test-bundle;
 
         test-enclave = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
-          ociBundlePath = test-bundle;
+          ociBundleArchive = testBundleArchive;
         };
 
         # Note: deliberately does NOT pass `enclaviaChainInitPkg`. The
@@ -285,7 +336,7 @@
         # test wrapper.
         test-enclave-debug = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
-          ociBundlePath = test-bundle;
+          ociBundleArchive = testBundleArchive;
           debugMode = true;
         };
 
@@ -301,10 +352,11 @@
         test-ws-bundle = pkgs.callPackage ./nix/test-ws-bundle.nix {
           inherit pkgs wsEchoBin;
         };
+        testWsBundleArchive = mkOciBundleArchive "test-ws-oci-bundle" test-ws-bundle;
 
         test-enclave-ws-debug = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
-          ociBundlePath = test-ws-bundle;
+          ociBundleArchive = testWsBundleArchive;
           debugMode = true;
         };
 
@@ -313,10 +365,11 @@
         # set by the e2e wrapper), writes "ping\n", and exits 0 iff the reply
         # is "pong\n". Used by tests/run_e2e_egress.sh.
         test-egress-bundle = pkgs.callPackage ./nix/test-egress-bundle.nix { inherit pkgs; };
+        testEgressBundleArchive = mkOciBundleArchive "test-egress-oci-bundle" test-egress-bundle;
 
         test-enclave-egress-debug = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
-          ociBundlePath = test-egress-bundle;
+          ociBundleArchive = testEgressBundleArchive;
           debugMode = true;
         };
 
@@ -328,15 +381,17 @@
         # SECRETS_PAYLOAD passed on stdin to secrets-host (and the
         # presence of the daemon itself).
         test-secrets-bundle = pkgs.callPackage ./nix/test-secrets-bundle.nix { inherit pkgs; };
+        testSecretsBundleArchive = mkOciBundleArchive "test-secrets-oci-bundle" test-secrets-bundle;
 
         test-enclave-secrets-debug = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
-          ociBundlePath = test-secrets-bundle;
+          ociBundleArchive = testSecretsBundleArchive;
           debugMode = true;
         };
 
         # --- Storage test bundle + enclave ---
         test-storage-bundle = pkgs.callPackage ./nix/test-storage-bundle.nix { inherit pkgs; };
+        testStorageBundleArchive = mkOciBundleArchive "test-storage-oci-bundle" test-storage-bundle;
 
         test-enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
           # enclaviaSecretsInitPkg is baked in here (unlike the other
@@ -346,7 +401,7 @@
           # before the KMS call (#199 / #198). The storage e2e exercises
           # that pull -> source -> scrub flow with static dummy creds.
           inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
-          ociBundlePath = test-storage-bundle;
+          ociBundleArchive = testStorageBundleArchive;
           debugMode = true;
           storageEnabled = true;
           customKernel = storageKernel;
@@ -357,7 +412,7 @@
         # cryptsetup overhead on TCG.
         test-enclave-storage-debug-no-luks = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg;
-          ociBundlePath = test-storage-bundle;
+          ociBundleArchive = testStorageBundleArchive;
           debugMode = true;
           storageEnabled = true;
           skipLuks = true;
@@ -925,6 +980,7 @@
       in
       {
         checks = {
+          oci-metadata = ociMetadataCheck;
           rootfs-size-base = baseRootfsSizeCheck;
           rootfs-size-storage = storageRootfsSizeCheck;
         };

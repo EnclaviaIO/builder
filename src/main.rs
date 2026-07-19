@@ -17,6 +17,8 @@ enum Error {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid generated OCI archive: {0}")]
+    OciArchive(String),
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -33,7 +35,10 @@ const SENSITIVE_COMMAND_FLAGS: &[&str] = &[
 ];
 
 #[derive(Parser)]
-#[command(name = "builder", about = "Build Enclavia enclave images from Docker images")]
+#[command(
+    name = "builder",
+    about = "Build Enclavia enclave images from Docker images"
+)]
 enum Cli {
     /// Build an EIF from a Docker image
     Build {
@@ -174,7 +179,7 @@ struct BuildResult {
     pcrs: PcrValues,
 }
 
-async fn run_cmd(cmd: &str, args: &[&str]) -> Result<String> {
+async fn run_cmd_with_env(cmd: &str, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
     let logged_args = redact_command_args(args);
     info!(cmd, args = ?logged_args, "running command");
 
@@ -185,6 +190,7 @@ async fn run_cmd(cmd: &str, args: &[&str]) -> Result<String> {
     // stdout stays piped — callers parse JSON from it.
     let output = Command::new(cmd)
         .args(args)
+        .envs(env.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()?
@@ -234,6 +240,10 @@ fn redact_command_args(args: &[&str]) -> Vec<String> {
             (*arg).to_string()
         })
         .collect()
+}
+
+async fn run_cmd(cmd: &str, args: &[&str]) -> Result<String> {
+    run_cmd_with_env(cmd, args, &[]).await
 }
 
 /// Pull a Docker image to a local OCI layout using skopeo.
@@ -334,88 +344,11 @@ async fn unpack_bundle(oci_layout: &Path, bundle_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Replace the image's hardlinks in the bundle rootfs with relative symlinks.
-///
-/// Base images (busybox, alpine, distroless, ...) hardlink hundreds of applets
-/// to a single binary. Nix's NAR format does not represent hardlinks, so when
-/// the bundle is imported into the store as a `path:` input every hardlink
-/// becomes an independent full copy -- a ~4 MB rootfs explodes to ~400 MB,
-/// which bloats the measured rootfs -> cpio -> EIF until it overshoots the
-/// enclave memory allocation and `nitro-cli run-enclave` fails with E26.
-/// Symlinks, unlike hardlinks, are preserved by nix and by every `cp -r` in
-/// nitro-util's ramdisk build, so the packed image stays the source size.
-///
-/// We touch ONLY files the image itself hardlinked (`nlink > 1`, shared
-/// inode): those are explicitly the same file, and hardlinked names already
-/// share one inode's permissions, so a symlink (which resolves to the target's
-/// perms) changes nothing. We deliberately do NOT dedup merely
-/// identical-content files -- the image may keep those separate on purpose.
-/// Deterministic (keeps the lexicographically-smallest path in each hardlink
-/// group) so EIFs stay bit-reproducible.
-fn dehardlink_bundle(bundle_dir: &Path) -> Result<()> {
-    use std::collections::BTreeMap;
-    use std::os::unix::fs::MetadataExt;
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
 
-    let rootfs = bundle_dir.join("rootfs");
-    if !rootfs.is_dir() {
-        return Ok(());
-    }
-
-    // Group regular files that have more than one link by (device, inode).
-    let mut groups: BTreeMap<(u64, u64), Vec<PathBuf>> = BTreeMap::new();
-    for entry in walkdir::WalkDir::new(&rootfs) {
-        let entry = entry.map_err(std::io::Error::from)?;
-        // symlink_metadata = lstat: never follow symlinks (a symlink is not a
-        // regular file, so it is skipped anyway, but be explicit).
-        let meta = entry.path().symlink_metadata()?;
-        if meta.is_file() && meta.nlink() > 1 {
-            groups
-                .entry((meta.dev(), meta.ino()))
-                .or_default()
-                .push(entry.path().to_path_buf());
-        }
-    }
-
-    let mut converted = 0usize;
-    for (_inode, mut paths) in groups {
-        if paths.len() < 2 {
-            continue;
-        }
-        paths.sort();
-        let canonical = &paths[0];
-        for dup in &paths[1..] {
-            let target = relative_symlink_target(dup, canonical);
-            std::fs::remove_file(dup)?;
-            std::os::unix::fs::symlink(&target, dup)?;
-            converted += 1;
-        }
-    }
-
-    if converted > 0 {
-        info!(converted, "converted bundle hardlinks to relative symlinks");
-    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     Ok(())
-}
-
-/// Path of `target` expressed relative to the directory containing `link`
-/// (both absolute and sharing a common ancestor, e.g. the bundle rootfs).
-fn relative_symlink_target(link: &Path, target: &Path) -> PathBuf {
-    let link_dir = link.parent().unwrap_or_else(|| Path::new(""));
-    let link_comps: Vec<_> = link_dir.components().collect();
-    let target_comps: Vec<_> = target.components().collect();
-    let common = link_comps
-        .iter()
-        .zip(target_comps.iter())
-        .take_while(|(a, b)| a == b)
-        .count();
-    let mut rel = PathBuf::new();
-    for _ in common..link_comps.len() {
-        rel.push("..");
-    }
-    for c in &target_comps[common..] {
-        rel.push(c.as_os_str());
-    }
-    rel
 }
 
 /// Patch the OCI bundle config for enclave compatibility.
@@ -462,31 +395,11 @@ fn patch_bundle_config(bundle_dir: &Path) -> Result<()> {
         *terminal = serde_json::Value::Bool(false);
     }
 
-    // Grant all capabilities — the enclave is the security boundary, not the
-    // container. Without CAP_DAC_OVERRIDE, the container process (UID 0) can't
-    // write to files owned by the build user (UID 1000 from umoci --rootless).
-    let all_caps: serde_json::Value = serde_json::json!([
-        "CAP_AUDIT_WRITE", "CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH",
-        "CAP_FOWNER", "CAP_FSETID", "CAP_KILL", "CAP_MKNOD", "CAP_NET_BIND_SERVICE",
-        "CAP_NET_RAW", "CAP_SETFCAP", "CAP_SETGID", "CAP_SETPCAP", "CAP_SETUID",
-        "CAP_SYS_CHROOT"
-    ]);
-    if let Some(caps) = config.pointer_mut("/process/capabilities") {
-        if let Some(obj) = caps.as_object_mut() {
-            for key in &["bounding", "effective", "inheritable", "permitted", "ambient"] {
-                obj.insert(key.to_string(), all_caps.clone());
-            }
-        }
-    }
-
     // Strip all mounts — without mount namespace, crun tries to mount in the
     // global namespace on initramfs, which fails for cgroups, devpts, bind-mounts
     // of /etc/resolv.conf, etc. Essential filesystems (proc, dev, sys, tmp) are
     // pre-mounted by the init script instead.
-    if let Some(mounts) = config
-        .pointer_mut("/mounts")
-        .and_then(|v| v.as_array_mut())
-    {
+    if let Some(mounts) = config.pointer_mut("/mounts").and_then(|v| v.as_array_mut()) {
         let before = mounts.len();
         mounts.clear();
         if before > 0 {
@@ -496,6 +409,7 @@ fn patch_bundle_config(bundle_dir: &Path) -> Result<()> {
 
     let patched = serde_json::to_string_pretty(&config)?;
     std::fs::write(&config_path, patched)?;
+    set_mode(&config_path, 0o644)?;
 
     // Point /etc/resolv.conf at the in-enclave unbound on 127.0.0.1.
     // **Always overwrite** — the previous `if !resolv.exists()` branch
@@ -516,34 +430,17 @@ fn patch_bundle_config(bundle_dir: &Path) -> Result<()> {
     let resolv = bundle_dir.join("rootfs/etc/resolv.conf");
     std::fs::create_dir_all(bundle_dir.join("rootfs/etc"))?;
     std::fs::write(&resolv, "nameserver 127.0.0.1\n")?;
+    set_mode(&resolv, 0o644)?;
     info!("wrote /etc/resolv.conf in container rootfs");
 
     Ok(())
 }
 
-/// Make the OCI bundle deterministic before passing it to `nix build`.
-///
-/// `nix build` ingests the bundle via `--override-input oci-bundle path:<dir>`,
-/// and `path:` narHashing folds in both file content and mtimes. Without this
-/// step the input narHash is fresh on every invocation, which propagates
-/// through `enclave-rootfs` → `user-initramfs.cpio.gz` → final EIF and
-/// changes PCR0/PCR2 every run (builder#10).
-///
-/// Two sources of nondeterminism, both addressed here:
-///
-/// 1. **mtimes** — `umoci unpack`, `patch_bundle_config`, and
-///    `write_enclavia_config` all create/touch files with the host's current
-///    time. We reset every entry's mtime/atime to the Unix epoch.
-/// 2. **umoci's bookkeeping files** — `umoci.json` records the host UID/GID
-///    used for the rootless unpack (varies across machines/users), and the
-///    `sha256_*.mtree` manifest embeds the unpack path, hostname, and a
-///    real-time `date:` header. Neither is consulted at enclave runtime, so
-///    we delete them outright.
-///
-/// Symlinks are skipped for the mtime reset — `set_file_times` would follow
-/// them and rewrite the target's times.
-fn normalize_bundle_for_nix(dir: &Path) -> Result<()> {
-    // 1. Strip umoci's per-host bookkeeping.
+/// Remove umoci files that describe the build host rather than the runtime
+/// bundle. The generated archive's `SOURCE_DATE_EPOCH` clamps all mtimes, so
+/// timestamps no longer need to be rewritten through the unpacked tree (which
+/// is important for images containing mode-000 directories).
+fn strip_bundle_bookkeeping(dir: &Path) -> Result<()> {
     let mut removed = 0usize;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -554,22 +451,150 @@ fn normalize_bundle_for_nix(dir: &Path) -> Result<()> {
             removed += 1;
         }
     }
-
-    // 2. Reset mtime/atime on everything that survives.
-    let epoch = filetime::FileTime::from_unix_time(0, 0);
-    let mut touched = 0usize;
-    for entry in walkdir::WalkDir::new(dir) {
-        let entry = entry.map_err(|e| std::io::Error::other(e.to_string()))?;
-        if entry.file_type().is_symlink() {
-            continue;
-        }
-        filetime::set_file_times(entry.path(), epoch, epoch)?;
-        touched += 1;
-    }
     info!(
-        ?dir, removed_bookkeeping = removed, touched_entries = touched,
-        "normalized bundle for deterministic nix path-input"
+        ?dir,
+        removed_bookkeeping = removed,
+        "stripped umoci bookkeeping"
     );
+    Ok(())
+}
+
+/// Move the bundle into the layout expected in the enclave's user initramfs.
+/// `rename` keeps every rootfs inode and hardlink intact. The measured
+/// Enclavia configuration and optional egress policy are also copied to their
+/// outer-rootfs locations so the archive can be overlaid directly at boot.
+fn stage_bundle_payload(bundle_dir: &Path, payload_dir: &Path) -> Result<()> {
+    let bundle_dest = payload_dir.join("var/lib/oci/bundle");
+    let enclavia_dir = payload_dir.join("etc/enclavia");
+
+    std::fs::create_dir_all(bundle_dest.parent().expect("bundle has a parent"))?;
+    std::fs::create_dir_all(&enclavia_dir)?;
+    for dir in [
+        payload_dir,
+        &payload_dir.join("var"),
+        &payload_dir.join("var/lib"),
+        &payload_dir.join("var/lib/oci"),
+        &payload_dir.join("etc"),
+        &enclavia_dir,
+    ] {
+        set_mode(dir, 0o755)?;
+    }
+
+    let config_src = bundle_dir.join("enclavia-config.json");
+    let config_dst = enclavia_dir.join("config.json");
+    std::fs::copy(&config_src, &config_dst)?;
+    set_mode(&config_dst, 0o644)?;
+
+    let egress_src = bundle_dir.join("egress.json");
+    if egress_src.is_file() {
+        let egress_dst = enclavia_dir.join("egress.json");
+        std::fs::copy(&egress_src, &egress_dst)?;
+        set_mode(&egress_dst, 0o644)?;
+    }
+
+    std::fs::rename(bundle_dir, &bundle_dest)?;
+    info!(?payload_dir, "staged OCI bundle payload");
+    Ok(())
+}
+
+fn sha256_blob_path(layout: &Path, digest: &str) -> Result<PathBuf> {
+    let hex = digest
+        .strip_prefix("sha256:")
+        .filter(|hex| hex.len() == 64)
+        .filter(|hex| hex.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')))
+        .ok_or_else(|| Error::OciArchive(format!("expected sha256 digest, got `{digest}`")))?;
+    Ok(layout.join("blobs/sha256").join(hex))
+}
+
+/// Resolve the sole uncompressed layer produced by `umoci insert`.
+fn generated_layer_path(layout: &Path) -> Result<PathBuf> {
+    let index: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(layout.join("index.json"))?)?;
+    let manifests = index
+        .get("manifests")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Error::OciArchive("index.json has no manifests array".into()))?;
+    if manifests.len() != 1 {
+        return Err(Error::OciArchive(format!(
+            "expected one generated manifest, found {}",
+            manifests.len()
+        )));
+    }
+    let manifest_digest = manifests[0]
+        .get("digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::OciArchive("generated manifest has no digest".into()))?;
+    let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        sha256_blob_path(layout, manifest_digest)?,
+    )?)?;
+    let layers = manifest
+        .get("layers")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Error::OciArchive("generated manifest has no layers array".into()))?;
+    if layers.len() != 1 {
+        return Err(Error::OciArchive(format!(
+            "expected one generated layer, found {}",
+            layers.len()
+        )));
+    }
+    let media_type = layers[0]
+        .get("mediaType")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::OciArchive("generated layer has no mediaType".into()))?;
+    if media_type != "application/vnd.oci.image.layer.v1.tar" {
+        return Err(Error::OciArchive(format!(
+            "expected an uncompressed OCI tar layer, got `{media_type}`"
+        )));
+    }
+    let layer_digest = layers[0]
+        .get("digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::OciArchive("generated layer has no digest".into()))?;
+    sha256_blob_path(layout, layer_digest)
+}
+
+/// Serialize the staged payload with umoci's OCI-aware tar generator.
+///
+/// A generic tar invocation would record the build user's ownership after a
+/// rootless unpack. umoci understands `user.rootlesscontainers`, restores the
+/// original container UID/GID in each tar header, preserves hardlinks and
+/// supported xattrs, walks paths deterministically, and clamps timestamps via
+/// SOURCE_DATE_EPOCH. Only the tar bytes cross the Nix path-input boundary.
+async fn create_bundle_archive(
+    payload_dir: &Path,
+    archive_layout: &Path,
+    input_dir: &Path,
+) -> Result<()> {
+    let image_arg = format!("{}:latest", archive_layout.display());
+    run_cmd(
+        "umoci",
+        &["init", "--layout", &archive_layout.to_string_lossy()],
+    )
+    .await?;
+    run_cmd("umoci", &["new", "--image", &image_arg]).await?;
+    run_cmd_with_env(
+        "umoci",
+        &[
+            "insert",
+            "--rootless",
+            "--compress=none",
+            "--no-history",
+            "--image",
+            &image_arg,
+            &payload_dir.to_string_lossy(),
+            "/rootfs",
+        ],
+        &[("SOURCE_DATE_EPOCH", "1")],
+    )
+    .await?;
+
+    let layer = generated_layer_path(archive_layout)?;
+    std::fs::create_dir_all(input_dir)?;
+    set_mode(input_dir, 0o755)?;
+    let archive = input_dir.join("bundle.tar");
+    std::fs::copy(&layer, &archive)?;
+    set_mode(&archive, 0o644)?;
+    info!(?archive, "created deterministic OCI bundle archive");
     Ok(())
 }
 
@@ -581,12 +606,12 @@ fn normalize_bundle_for_nix(dir: &Path) -> Result<()> {
 /// are replaced by passing `--override-input enclavia-crates path:...`
 /// and `--override-input enclavia path:...` to the QEMU wrapper.
 async fn build_eif(
-    bundle_dir: &Path,
+    bundle_input_dir: &Path,
     result_link: &Path,
     debug: bool,
     storage: bool,
 ) -> Result<()> {
-    let bundle_arg = format!("path:{}", bundle_dir.display());
+    let bundle_arg = format!("path:{}", bundle_input_dir.display());
     let out_arg = result_link.to_string_lossy();
 
     // Resolve the builder's own directory so `nix build` finds the correct flake
@@ -788,7 +813,8 @@ fn parse_synchronizer_pcrs(arg: &str) -> std::result::Result<Vec<PcrValues>, Str
     Ok(triples)
 }
 
-/// Write the enclavia config into the bundle so enclave.nix picks it up.
+/// Write the measured Enclavia config into the bundle. Payload staging also
+/// copies it to `/etc/enclavia/config.json` in the outer initramfs layout.
 #[allow(clippy::too_many_arguments)]
 fn write_enclavia_config(
     bundle_dir: &Path,
@@ -868,6 +894,7 @@ fn write_enclavia_config(
 
     let path = bundle_dir.join("enclavia-config.json");
     std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap())?;
+    set_mode(&path, 0o644)?;
     info!(
         container_port,
         storage,
@@ -904,6 +931,9 @@ async fn build(
 
     let oci_layout = tmp_path.join("image");
     let bundle_dir = tmp_path.join("bundle");
+    let payload_dir = tmp_path.join("payload");
+    let archive_layout = tmp_path.join("bundle-archive-image");
+    let bundle_input_dir = tmp_path.join("bundle-input");
     let result_link = tmp_path.join("result");
 
     // 1. Pull the Docker image
@@ -913,15 +943,6 @@ async fn build(
     // 2. Unpack into OCI bundle
     info!("unpacking OCI bundle");
     unpack_bundle(&oci_layout, &bundle_dir).await?;
-
-    // 2b. Convert the image's hardlinks to relative symlinks BEFORE nix sees
-    // the bundle. Nix's NAR format can't represent hardlinks, so importing the
-    // bundle `path:` flattens every hardlink into an independent full copy: a
-    // ~4 MB busybox/alpine rootfs (hundreds of applets hardlinked to one
-    // binary) balloons to ~400 MB, bloating the EIF past the enclave's memory
-    // allocation (nitro-cli E26). Symlinks survive nix and the ramdisk build
-    // untouched. Must happen here, while the hardlink structure still exists.
-    dehardlink_bundle(&bundle_dir)?;
 
     // 3. Patch OCI config for enclave compatibility
     patch_bundle_config(&bundle_dir)?;
@@ -941,28 +962,37 @@ async fn build(
     )?;
 
     // 4b. If the caller supplied an egress allowlist, drop it into the
-    // bundle at a fixed name. `enclave.nix` checks for this path and
-    // installs the file at `/etc/enclavia/egress.json` in the rootfs.
+    // bundle at a fixed name. Payload staging also copies it to the archive's
+    // `/etc/enclavia/egress.json` location.
     // The file content is hashed into the EIF, so changing it changes
     // PCR2 (rootfs) and is visible via `enclavia reproduce`.
     if let Some(src) = egress_allowlist {
         let dst = bundle_dir.join("egress.json");
         std::fs::copy(src, &dst)?;
+        set_mode(&dst, 0o644)?;
         info!(src = ?src, dst = ?dst, "copied egress allowlist into bundle");
     }
 
-    // 5. Normalize bundle so `path:` narHashing is deterministic
-    normalize_bundle_for_nix(&bundle_dir)?;
+    // 5. Remove host bookkeeping, then move the still-intact bundle tree into
+    // its final initramfs layout. No recursive copy occurs here: OCI hardlinks
+    // remain hardlinks until umoci serializes them below.
+    strip_bundle_bookkeeping(&bundle_dir)?;
+    stage_bundle_payload(&bundle_dir, &payload_dir)?;
 
-    // 6. Build the EIF
+    // 6. Serialize the payload into a deterministic OCI tar. Nix receives a
+    // directory containing only this regular file, so NAR canonicalisation can
+    // no longer reinterpret the customer filesystem's metadata.
+    create_bundle_archive(&payload_dir, &archive_layout, &bundle_input_dir).await?;
+
+    // 7. Build the EIF
     info!(storage, "building enclave image");
-    build_eif(&bundle_dir, &result_link, debug, storage).await?;
+    build_eif(&bundle_input_dir, &result_link, debug, storage).await?;
 
-    // 7. Read PCR values
+    // 8. Read PCR values
     let pcrs = read_pcrs(&result_link)?;
     info!(pcr0 = %pcrs.pcr0, pcr1 = %pcrs.pcr1, pcr2 = %pcrs.pcr2, "PCR values");
 
-    // 8. Copy artifacts to output
+    // 9. Copy artifacts to output
     copy_artifacts(&result_link, output_dir)?;
 
     Ok(BuildResult {
@@ -1289,7 +1319,13 @@ mod tests {
         synchronizer_pcrs: Option<&[PcrValues]>,
         synchronizer_enabled: bool,
     ) -> serde_json::Value {
-        written_config_with_delay(debug, storage, synchronizer_pcrs, synchronizer_enabled, None)
+        written_config_with_delay(
+            debug,
+            storage,
+            synchronizer_pcrs,
+            synchronizer_enabled,
+            None,
+        )
     }
 
     fn written_config_with_delay(
@@ -1401,51 +1437,84 @@ mod tests {
     }
 
     #[test]
-    fn dehardlink_converts_only_hardlinks_to_relative_symlinks() {
+    fn patch_bundle_preserves_image_capability_sets() {
         let tmp = tempfile::tempdir().unwrap();
-        let rootfs = tmp.path().join("rootfs");
-        std::fs::create_dir_all(rootfs.join("bin")).unwrap();
-        std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("rootfs/etc")).unwrap();
+        let capabilities = serde_json::json!({
+            "bounding": ["CAP_NET_BIND_SERVICE"],
+            "effective": ["CAP_NET_BIND_SERVICE"],
+            "inheritable": [],
+            "permitted": ["CAP_NET_BIND_SERVICE"],
+            "ambient": []
+        });
+        let config = serde_json::json!({
+            "hostname": "rootless-host",
+            "process": { "terminal": true, "capabilities": capabilities },
+            "linux": {
+                "namespaces": [{"type": "user"}],
+                "uidMappings": [{"containerID": 0, "hostID": 1000, "size": 1}],
+                "gidMappings": [{"containerID": 0, "hostID": 1000, "size": 1}]
+            },
+            "mounts": [{"destination": "/proc", "type": "proc", "source": "proc"}]
+        });
+        std::fs::write(
+            tmp.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
 
-        // A hardlink group of three names sharing one inode (like busybox).
+        patch_bundle_config(tmp.path()).unwrap();
+
+        let patched: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(patched["process"]["capabilities"], capabilities);
+        assert_eq!(patched["process"]["terminal"], serde_json::json!(false));
+        assert_eq!(patched["linux"]["namespaces"], serde_json::json!([]));
+        assert!(patched["linux"].get("uidMappings").is_none());
+        assert!(patched["linux"].get("gidMappings").is_none());
+        assert!(patched.get("hostname").is_none());
+        assert_eq!(patched["mounts"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn staging_preserves_hardlinks_and_places_measured_config() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("bundle");
+        let rootfs = bundle.join("rootfs");
+        let payload = tmp.path().join("payload");
+        std::fs::create_dir_all(rootfs.join("bin")).unwrap();
+
         std::fs::write(rootfs.join("bin/busybox"), b"BUSYBOX").unwrap();
         std::fs::hard_link(rootfs.join("bin/busybox"), rootfs.join("bin/ls")).unwrap();
-        std::fs::hard_link(rootfs.join("bin/busybox"), rootfs.join("usr/bin/cat")).unwrap();
-        // An INDEPENDENT file with identical content (separate inode) must be
-        // left alone -- we only touch what the image itself hardlinked.
-        std::fs::write(rootfs.join("bin/other"), b"BUSYBOX").unwrap();
+        std::fs::write(bundle.join("config.json"), b"{}").unwrap();
+        std::fs::write(
+            bundle.join("enclavia-config.json"),
+            b"{\"listen_vsock_port\":5000}",
+        )
+        .unwrap();
+        std::fs::write(bundle.join("egress.json"), b"{\"version\":1}").unwrap();
 
-        dehardlink_bundle(tmp.path()).unwrap();
+        stage_bundle_payload(&bundle, &payload).unwrap();
 
-        // Canonical = lexicographically-smallest path in the group; stays real.
-        assert!(rootfs
-            .join("bin/busybox")
-            .symlink_metadata()
-            .unwrap()
-            .is_file());
-        // The other two names became symlinks that still read the same bytes.
-        for name in ["bin/ls", "usr/bin/cat"] {
-            let p = rootfs.join(name);
-            assert!(
-                p.symlink_metadata().unwrap().file_type().is_symlink(),
-                "{name} should be a symlink"
-            );
-            assert_eq!(std::fs::read(&p).unwrap(), b"BUSYBOX");
-        }
-        // Targets are RELATIVE so they resolve inside the container chroot.
+        assert!(!bundle.exists());
+        let staged_rootfs = payload.join("var/lib/oci/bundle/rootfs");
+        let busybox = staged_rootfs.join("bin/busybox");
+        let ls = staged_rootfs.join("bin/ls");
+        let busybox_meta = busybox.metadata().unwrap();
+        let ls_meta = ls.metadata().unwrap();
+        assert_eq!(busybox_meta.ino(), ls_meta.ino());
+        assert_eq!(busybox_meta.nlink(), 2);
+        assert!(!ls.symlink_metadata().unwrap().file_type().is_symlink());
         assert_eq!(
-            std::fs::read_link(rootfs.join("bin/ls")).unwrap(),
-            PathBuf::from("busybox")
+            std::fs::read(payload.join("etc/enclavia/config.json")).unwrap(),
+            b"{\"listen_vsock_port\":5000}"
         );
         assert_eq!(
-            std::fs::read_link(rootfs.join("usr/bin/cat")).unwrap(),
-            PathBuf::from("../../bin/busybox")
+            std::fs::read(payload.join("etc/enclavia/egress.json")).unwrap(),
+            b"{\"version\":1}"
         );
-        // The independent identical-content file is untouched.
-        assert!(rootfs
-            .join("bin/other")
-            .symlink_metadata()
-            .unwrap()
-            .is_file());
     }
 }

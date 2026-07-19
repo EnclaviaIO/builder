@@ -2,7 +2,10 @@
   pkgs,
   nitroLib,
   enclaviaServerPkg,
-  ociBundlePath,
+  # Uncompressed deterministic tar whose entries are rooted at `rootfs/`.
+  # Production archives come from the Rust builder; in-tree test archives are
+  # assembled by mkOciBundleArchive in flake.nix.
+  ociBundleArchive,
   containerPort ? 8080,
   debugMode ? false,
   nbdClientPkg ? null,
@@ -18,8 +21,8 @@
   enclaviaChainInitPkg ? null,
   storageEnabled ? false,
   customKernel ? null,
-  # CI size checks need the assembled, uncompressed rootfs without paying
-  # to build the kernel, ramdisks, or final EIF.
+  # CI size checks need the builder-owned, uncompressed runtime rootfs without
+  # paying to build the customer payload ramdisk, kernel, or final EIF.
   rootfsOnly ? false,
   # Diagnostic: skip LUKS and mount raw btrfs on the NBD device directly.
   # Used to isolate proxy throughput from cryptsetup overhead during testing.
@@ -44,22 +47,10 @@ let
     ldflags = [ "-s" "-w" ];
   };
 
-  # If the builder placed an enclavia-config.json in the bundle, use it.
-  # Otherwise generate a default one.
-  bundleConfig = ociBundlePath + "/enclavia-config.json";
-  hasCustomConfig = builtins.pathExists bundleConfig;
-
-  # Egress allowlist. The builder copies the user-supplied JSON into the
-  # bundle as `egress.json` (only when the caller passed
-  # `--egress-allowlist`). When present, the file is installed at
-  # `/etc/enclavia/egress.json` and the in-enclave daemon enforces it.
-  # When absent, no file is baked in and the daemon stays at deny-all.
-  bundleEgressAllowlist = ociBundlePath + "/egress.json";
-  hasEgressAllowlist = builtins.pathExists bundleEgressAllowlist;
-
-  enclaviaConfig = if hasCustomConfig
-    then bundleConfig
-    else pkgs.writeText "enclavia-config.json" (builtins.toJSON ({
+  # A fallback for hand-built test bundles. Production archives contain a
+  # later `/rootfs/etc/enclavia/config.json` cpio member, which overwrites this
+  # file when the kernel expands the OCI payload ramdisk.
+  enclaviaConfig = pkgs.writeText "enclavia-config.json" (builtins.toJSON ({
       listen_vsock_port = 5000;
       oci_bundle_path = "/var/lib/oci/bundle";
       customer_app = {
@@ -259,16 +250,9 @@ let
     # enclave's identity, so it stays off the measured image. One EIF boots
     # in either environment with nothing to flip per-build.)
 
-    # Enclavia config. This file carries the enclave's trust anchors
-    # (#47 control_public_key, enclavia#208 synchronizer.expected_pcrs +
-    # debug_attestation), which are only worth anything because they sit
-    # INSIDE the measured rootfs: the rootfs is hashed into the EIF and
-    # shows up in the PCRs, so the host can't substitute its own values
-    # at runtime. Assert at build time that the copy actually landed,
-    # is valid JSON, and that any synchronizer section carries a
-    # non-empty expected_pcrs list (an empty one makes the in-enclave
-    # nbd-client fail-stop at boot, so catch it before it's measured
-    # into an EIF).
+    # Default Enclavia config for hand-built test archives. A production
+    # archive overlays the builder-generated measured config in the later OCI
+    # ramdisk. Keep this fallback valid and self-contained for the test EIFs.
     cp ${enclaviaConfig} $out/etc/enclavia/config.json
     if ! test -s $out/etc/enclavia/config.json; then
       echo "enclave-rootfs: /etc/enclavia/config.json is missing or empty in the measured rootfs" >&2
@@ -284,13 +268,6 @@ let
       echo "(must be a JSON object; a synchronizer section must carry a non-empty expected_pcrs array)" >&2
       exit 1
     fi
-
-    ${if hasEgressAllowlist then ''
-    # Egress allowlist (#138). The in-enclave daemon reads this at boot;
-    # init.sh only overwrites it when the e2e test fixtures are on the
-    # kernel command line.
-    cp ${bundleEgressAllowlist} $out/etc/enclavia/egress.json
-    '' else ""}
 
     # Every binary in this list is static (the Enclavia services target
     # musl; the remaining tools come from pkgsStatic). They can still
@@ -324,19 +301,6 @@ let
     done
   '';
 
-  # Keep the customer OCI bundle separate from the zero-reference runtime
-  # assertion above. A Nix-built workload may intentionally carry dynamic
-  # libraries at /nix/store paths inside its own container rootfs (as the
-  # WS test fixture does); those references are self-contained within the
-  # bundle and must not cause the same closure to be copied into the outer
-  # initramfs. The EIF therefore receives this assembled tree directly,
-  # with copyToRootWithClosure disabled below.
-  rootfs = pkgs.runCommand "enclave-rootfs" {} ''
-    mkdir -p $out
-    cp -r ${runtimeRootfs}/. $out/
-    cp -r ${ociBundlePath} $out/var/lib/oci/bundle
-  '';
-
   # Always the patched init (never AWS's stock CID-3-only blob init), so a
   # single EIF boots on both QEMU and real Nitro: the patched init
   # heartbeats CID 3 (Nitro parent) AND CID 2 (vhost-device-vsock host), then
@@ -347,19 +311,43 @@ let
   # drives debug-attestation trust anchors in config.json.)
   initBinary = "${patchedInit}/bin/init";
 
-in
-  if rootfsOnly then rootfs else nitroLib.buildEif {
-    name = "enclavia-enclave";
-    kernel = if customKernel != null
-      then "${customKernel}/bzImage"
-      else blobs.kernel;
-    kernelConfig = if customKernel != null
-      then customKernel.configfile
-      else blobs.kernelConfig;
-    # Modern kernels (6.x+) have the NSM guest driver built-in
-    nsmKo = if customKernel != null then null else blobs.nsmKo;
-    copyToRoot = rootfs;
-    copyToRootWithClosure = false;
+  # nitro-util's ordinary buildEif path copies `copyToRoot` through two Nix
+  # derivation outputs before cpio generation. That is fine for our own
+  # runtime tree, but it canonicalises a customer's ownership, hardlinks, and
+  # permission bits. Build the ordinary runtime ramdisk first, then append a
+  # second user ramdisk converted directly from the deterministic tar. The
+  # kernel expands ramdisks in order, so the archive supplies the OCI bundle,
+  # measured config, and optional egress policy on top of runtimeRootfs.
+  runtimeRamdisk = nitroLib.mkUserRamdisk {
     entrypoint = "/bin/enclave-init";
+    env = "";
+    rootfs = runtimeRootfs;
+  };
+
+  ociBundleRamdisk = pkgs.runCommand "oci-bundle-initramfs.cpio.gz" {
+    nativeBuildInputs = [ pkgs.python3 pkgs.gzip ];
+  } ''
+    set -euo pipefail
+    python3 ${./tar-to-cpio.py} ${ociBundleArchive} \
+      | gzip -n > $out
+  '';
+
+  kernel = if customKernel != null
+    then "${customKernel}/bzImage"
+    else blobs.kernel;
+  kernelConfig = if customKernel != null
+    then customKernel.configfile
+    else blobs.kernelConfig;
+  # Modern kernels (6.x+) have the NSM guest driver built-in.
+  nsmKo = if customKernel != null then null else blobs.nsmKo;
+  systemRamdisk = nitroLib.mkSysRamdisk {
     init = initBinary;
+    inherit nsmKo;
+  };
+
+in
+  if rootfsOnly then runtimeRootfs else nitroLib.mkEif {
+    name = "enclavia-enclave";
+    inherit kernel kernelConfig;
+    ramdisks = [ systemRamdisk runtimeRamdisk ociBundleRamdisk ];
   }
