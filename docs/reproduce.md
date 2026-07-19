@@ -47,7 +47,9 @@ content-addressed:
 - **The egress allowlist JSON.** The user-supplied document is stored
   verbatim on the row (`e.egress_allowlist`). At build time the
   builder stages it at `/etc/enclavia/egress.json` in the archived
-  rootfs payload. Changing it changes PCR2.
+  rootfs payload and selects the egress-enabled EIF recipe. Without a
+  policy, the deny-all recipe omits the egress daemon, Unbound, full
+  iproute2, and iptables. Changing that posture changes the EIF PCRs.
 
 - **The storage configuration** (size, mount point). Same story as
   the egress allowlist: it lives on the row and is baked into
@@ -90,8 +92,9 @@ same blobs.
    backend recorded at build time.
 
 2. **Rebuild the EIF locally.** The CLI invokes
-   `nix build path:<builder-rev>#<eif-name>` (where `<eif-name>` is
-   `enclave` or `enclave-storage` depending on the row), passing
+   `nix build path:<builder-rev>#<eif-name>`. Storage adds `-storage`,
+   an allowlist adds `-egress`, and debug mode adds the final `-debug`
+   suffix, so the target name encodes the measured feature set. The CLI passes
    `--override-input enclavia-crates path:<crates-rev>` and, for the
    image input, a deterministic OCI payload archive produced from the
    pinned digest. The builder binary is the same one the backend ran,
@@ -114,7 +117,9 @@ reproducer surfaces the allowlist document from the row alongside the
 PCRs so the user can see exactly which destinations the running
 enclave is allowed to reach. Changing the allowlist necessarily
 changes PCR2, which means a fresh attestation, which means clients can
-notice that the egress posture has changed.
+notice that the egress posture has changed. When the row has no allowlist,
+the rebuilt EIF also proves that the in-enclave egress stack is absent rather
+than merely configured to deny traffic.
 
 ## Known limits
 

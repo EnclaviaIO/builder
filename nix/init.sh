@@ -133,12 +133,11 @@ if [ -x /bin/enclavia-egress ]; then
     # matching `<resolver>:53/tcp` entries into its IP allowlist so
     # unbound's outbound forwarder traffic is permitted.
     #
-    # We only kick off unbound if the rootfs actually shipped it. The
-    # daemon is only present when enclavia-egress is, but storage-only
-    # / debug-only EIFs may still want the egress daemon without a real
-    # allowlist; in that case unbound stays running with an empty
-    # forward list, the daemon-side resolver call will fail, and
-    # hostname-allowlist entries will deny.
+    # We only kick off unbound if the rootfs actually shipped it. The daemon
+    # is present only in an egress-enabled EIF. A direct hand-built EIF may
+    # enable that feature without supplying a real allowlist; in that case
+    # unbound starts with an empty forward list and outbound policy remains
+    # deny-all.
     if [ -x /bin/unbound ] && [ -f /etc/unbound/unbound.conf.template ]; then
         RESOLVERS=""
         HOSTNAMES=""

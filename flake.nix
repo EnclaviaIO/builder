@@ -175,30 +175,42 @@
           }];
         };
 
-        enclave = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
-          inherit ociBundleArchive;
+        # Keep the production feature matrix in one recipe. The unsuffixed
+        # targets are deny-all and contain no egress stack; `-egress` targets
+        # opt in explicitly when the builder receives --egress-allowlist.
+        mkProductionEnclave = {
+          debugMode ? false,
+          storageEnabled ? false,
+          egressEnabled ? false,
+          rootfsOnly ? false,
+        }: pkgs.callPackage ./nix/enclave.nix {
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
+          inherit ociBundleArchive debugMode storageEnabled egressEnabled rootfsOnly;
+          enclaviaEgressPkg = if egressEnabled then enclaviaEgressPkg else null;
+          customKernel = if storageEnabled then storageKernel else null;
         };
 
-        enclave-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
-          inherit ociBundleArchive;
-          debugMode = true;
-        };
-
-        enclave-storage = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
-          inherit ociBundleArchive;
-          storageEnabled = true;
-          customKernel = storageKernel;
-        };
-
-        enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
-          inherit ociBundleArchive;
+        enclave = mkProductionEnclave { };
+        enclave-debug = mkProductionEnclave { debugMode = true; };
+        enclave-storage = mkProductionEnclave { storageEnabled = true; };
+        enclave-storage-debug = mkProductionEnclave {
           debugMode = true;
           storageEnabled = true;
-          customKernel = storageKernel;
+        };
+
+        enclave-egress = mkProductionEnclave { egressEnabled = true; };
+        enclave-egress-debug = mkProductionEnclave {
+          debugMode = true;
+          egressEnabled = true;
+        };
+        enclave-storage-egress = mkProductionEnclave {
+          storageEnabled = true;
+          egressEnabled = true;
+        };
+        enclave-storage-egress-debug = mkProductionEnclave {
+          debugMode = true;
+          storageEnabled = true;
+          egressEnabled = true;
         };
 
         # --- Uncompressed rootfs size budgets -------------------------
@@ -206,16 +218,17 @@
         # arbitrary in size and live in their own ramdisk, outside this budget.
         # rootfsOnly also avoids compiling the storage kernel or assembling an
         # EIF merely to count bytes.
-        baseRootfsForSizeCheck = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
-          inherit ociBundleArchive;
+        baseRootfsForSizeCheck = mkProductionEnclave {
           rootfsOnly = true;
         };
 
-        storageRootfsForSizeCheck = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
-          inherit ociBundleArchive;
+        storageRootfsForSizeCheck = mkProductionEnclave {
           storageEnabled = true;
+          rootfsOnly = true;
+        };
+
+        egressRootfsForFeatureCheck = mkProductionEnclave {
+          egressEnabled = true;
           rootfsOnly = true;
         };
 
@@ -237,6 +250,28 @@
           rootfs = storageRootfsForSizeCheck;
           maxBytes = storageRootfsSizeBudget;
         };
+
+        egressFeatureGateCheck = pkgs.runCommand "egress-feature-gate-check" { } ''
+          set -euo pipefail
+          for path in \
+            bin/enclavia-egress \
+            bin/unbound \
+            bin/iproute2-ip \
+            bin/xtables-legacy-multi \
+            bin/iptables \
+            etc/unbound
+          do
+            if [ -e ${baseRootfsForSizeCheck}/$path ]; then
+              echo "no-egress rootfs unexpectedly contains /$path" >&2
+              exit 1
+            fi
+            if [ ! -e ${egressRootfsForFeatureCheck}/$path ]; then
+              echo "egress-enabled rootfs is missing /$path" >&2
+              exit 1
+            fi
+          done
+          touch $out
+        '';
 
         ociMetadataCheck = pkgs.runCommand "oci-tar-to-cpio-metadata-check" {
           nativeBuildInputs = [ pkgs.python3 ];
@@ -317,7 +352,7 @@
         testBundleArchive = mkOciBundleArchive "test-oci-bundle" test-bundle;
 
         test-enclave = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg;
           ociBundleArchive = testBundleArchive;
         };
 
@@ -335,7 +370,7 @@
         # via the production launcher in enclavia-crates, not via this
         # test wrapper.
         test-enclave-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg;
           ociBundleArchive = testBundleArchive;
           debugMode = true;
         };
@@ -355,7 +390,7 @@
         testWsBundleArchive = mkOciBundleArchive "test-ws-oci-bundle" test-ws-bundle;
 
         test-enclave-ws-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg;
           ociBundleArchive = testWsBundleArchive;
           debugMode = true;
         };
@@ -371,6 +406,7 @@
           inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
           ociBundleArchive = testEgressBundleArchive;
           debugMode = true;
+          egressEnabled = true;
         };
 
         # --- Secrets test bundle + enclave (#169) ---
@@ -384,7 +420,7 @@
         testSecretsBundleArchive = mkOciBundleArchive "test-secrets-oci-bundle" test-secrets-bundle;
 
         test-enclave-secrets-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
+          inherit pkgs nitroLib enclaviaServerPkg enclaviaSecretsInitPkg;
           ociBundleArchive = testSecretsBundleArchive;
           debugMode = true;
         };
@@ -400,7 +436,7 @@
           # `enclavia-secrets-init --mode aws-creds` from vsock 5013
           # before the KMS call (#199 / #198). The storage e2e exercises
           # that pull -> source -> scrub flow with static dummy creds.
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg enclaviaSecretsInitPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaSecretsInitPkg;
           ociBundleArchive = testStorageBundleArchive;
           debugMode = true;
           storageEnabled = true;
@@ -411,7 +447,7 @@
         # against raw btrfs writes. Used to isolate proxy throughput from
         # cryptsetup overhead on TCG.
         test-enclave-storage-debug-no-luks = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaEgressPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg;
           ociBundleArchive = testStorageBundleArchive;
           debugMode = true;
           storageEnabled = true;
@@ -980,13 +1016,14 @@
       in
       {
         checks = {
+          egress-feature-gate = egressFeatureGateCheck;
           oci-metadata = ociMetadataCheck;
           rootfs-size-base = baseRootfsSizeCheck;
           rootfs-size-storage = storageRootfsSizeCheck;
         };
 
         packages = {
-          inherit builder enclave enclave-debug enclave-storage enclave-storage-debug debug-vm test-bundle test-enclave test-enclave-debug test-debug-vm test-storage-bundle test-enclave-storage-debug test-enclave-storage-debug-no-luks test-storage-vm test-egress-bundle test-enclave-egress-debug test-egress-vm test-ws-bundle test-enclave-ws-debug test-secrets-bundle test-enclave-secrets-debug test-secrets-vm;
+          inherit builder enclave enclave-debug enclave-egress enclave-egress-debug enclave-storage enclave-storage-debug enclave-storage-egress enclave-storage-egress-debug debug-vm test-bundle test-enclave test-enclave-debug test-debug-vm test-storage-bundle test-enclave-storage-debug test-enclave-storage-debug-no-luks test-storage-vm test-egress-bundle test-enclave-egress-debug test-egress-vm test-ws-bundle test-enclave-ws-debug test-secrets-bundle test-enclave-secrets-debug test-secrets-vm;
           default = builder;
         };
 

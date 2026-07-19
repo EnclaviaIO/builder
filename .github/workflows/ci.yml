@@ -56,6 +56,11 @@ jobs:
       - name: Check OCI metadata archive conversion
         run: nix build .#checks.x86_64-linux.oci-metadata --print-build-logs
 
+      # Prove deny-all EIFs omit the complete in-enclave egress stack while
+      # egress-enabled EIFs still contain every required binary and config.
+      - name: Check egress feature gate
+        run: nix build .#checks.x86_64-linux.egress-feature-gate --print-build-logs
+
       # Build only the uncompressed rootfs trees, not their kernels or EIFs.
       # Each check emits a stable per-path manifest and fails if the
       # builder-owned base/storage overhead exceeds its byte budget.

@@ -11,6 +11,9 @@
   nbdClientPkg ? null,
   enclaviaCryptoPkg ? null,
   enclaviaEgressPkg ? null,
+  # Build-time feature gate. A deny-all enclave leaves the entire outbound
+  # stack out of its measured rootfs rather than merely declining to start it.
+  egressEnabled ? false,
   # Per-enclave secrets injector (#169). Optional only because some
   # one-off test EIFs callPackage this file with a hand-built attrset;
   # the flake's regular invocations always supply it.
@@ -132,7 +135,7 @@ let
     # silently reintroduce its Nix closure into the EIF.
     allowedReferences = [ ];
   } ''
-    mkdir -p $out/bin $out/etc/enclavia $out/etc/unbound $out/var/lib/oci
+    mkdir -p $out/bin $out/etc/enclavia $out/var/lib/oci
 
     # Binaries
     cp ${enclaviaServerPkg}/bin/enclavia-server $out/bin/
@@ -204,7 +207,12 @@ let
     cp ${pkgs.pkgsStatic.util-linux}/bin/blkid $out/bin/
     '' else ""}
 
-    ${if enclaviaEgressPkg != null then ''
+    ${if egressEnabled then
+      if enclaviaEgressPkg == null then
+        throw "enclaviaEgressPkg is required when egressEnabled = true"
+      else ''
+    mkdir -p $out/etc/unbound
+
     # Egress daemon: owns /dev/net/tun, runs smoltcp on it, relays
     # outbound TCP to egress-host over vsock port 5006.
     cp ${enclaviaEgressPkg}/bin/enclavia-egress $out/bin/

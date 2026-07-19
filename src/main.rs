@@ -116,7 +116,7 @@ enum Cli {
         /// "egress":[...]}`). When set, the file is copied into the OCI
         /// bundle as `egress.json`; `enclave.nix` then places it at
         /// `/etc/enclavia/egress.json` in the rootfs. When unset, no file is
-        /// baked in: the in-enclave daemon defaults to deny-all.
+        /// baked in and the EIF omits the in-enclave egress stack entirely.
         #[arg(long)]
         egress_allowlist: Option<PathBuf>,
 
@@ -605,11 +605,25 @@ async fn create_bundle_archive(
 /// and `ENCLAVIA_FLAKE` env vars; in dev the flake's defaults (`./dummy-*`)
 /// are replaced by passing `--override-input enclavia-crates path:...`
 /// and `--override-input enclavia path:...` to the QEMU wrapper.
+fn eif_target(debug: bool, storage: bool, egress_enabled: bool) -> &'static str {
+    match (debug, storage, egress_enabled) {
+        (false, false, false) => "enclave",
+        (true, false, false) => "enclave-debug",
+        (false, true, false) => "enclave-storage",
+        (true, true, false) => "enclave-storage-debug",
+        (false, false, true) => "enclave-egress",
+        (true, false, true) => "enclave-egress-debug",
+        (false, true, true) => "enclave-storage-egress",
+        (true, true, true) => "enclave-storage-egress-debug",
+    }
+}
+
 async fn build_eif(
     bundle_input_dir: &Path,
     result_link: &Path,
     debug: bool,
     storage: bool,
+    egress_enabled: bool,
 ) -> Result<()> {
     let bundle_arg = format!("path:{}", bundle_input_dir.display());
     let out_arg = result_link.to_string_lossy();
@@ -627,16 +641,10 @@ async fn build_eif(
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from(".")),
     };
-    // `enclave-storage[-debug]` pulls in the storage-capable kernel (with NBD
-    // + dm-crypt + btrfs), the enclavia-crypto binary, and cryptsetup/btrfs
-    // userspace. The KMS key id lives in the bootstrap blob in the storage
-    // backing file, not in the EIF.
-    let target = match (debug, storage) {
-        (true, true) => "enclave-storage-debug",
-        (false, true) => "enclave-storage",
-        (true, false) => "enclave-debug",
-        (false, false) => "enclave",
-    };
+    // Storage variants add the custom kernel and storage userspace. Egress
+    // variants add the outbound networking stack only when the caller supplied
+    // an allowlist; deny-all images use the smaller default targets.
+    let target = eif_target(debug, storage, egress_enabled);
     let flake_ref = format!("{}#{}", builder_dir.display(), target);
 
     let mut args: Vec<String> = vec![
@@ -655,9 +663,9 @@ async fn build_eif(
         args.push(format!("path:{}", PathBuf::from(p).display()));
     }
 
-    // ENCLAVIA_FLAKE: production override for the public Enclavia
-    // workspace (enclavia-server, enclavia-egress, enclavia-crypto,
-    // nbd-client, mock-kms).
+    // ENCLAVIA_FLAKE: production override for the public Enclavia workspace
+    // (enclavia-server, optional enclavia-egress, enclavia-crypto, nbd-client,
+    // mock-kms).
     if let Some(p) = std::env::var_os("ENCLAVIA_FLAKE") {
         args.push("--override-input".into());
         args.push("enclavia".into());
@@ -985,8 +993,19 @@ async fn build(
     create_bundle_archive(&payload_dir, &archive_layout, &bundle_input_dir).await?;
 
     // 7. Build the EIF
-    info!(storage, "building enclave image");
-    build_eif(&bundle_input_dir, &result_link, debug, storage).await?;
+    info!(
+        storage,
+        egress_enabled = egress_allowlist.is_some(),
+        "building enclave image"
+    );
+    build_eif(
+        &bundle_input_dir,
+        &result_link,
+        debug,
+        storage,
+        egress_allowlist.is_some(),
+    )
+    .await?;
 
     // 8. Read PCR values
     let pcrs = read_pcrs(&result_link)?;
@@ -1159,6 +1178,24 @@ mod tests {
             "path:/tmp/bundle",
         ];
         assert_eq!(redact_command_args(&args), args.map(String::from));
+    }
+
+    #[test]
+    fn eif_targets_cover_storage_debug_and_egress_features() {
+        let cases = [
+            ((false, false, false), "enclave"),
+            ((true, false, false), "enclave-debug"),
+            ((false, true, false), "enclave-storage"),
+            ((true, true, false), "enclave-storage-debug"),
+            ((false, false, true), "enclave-egress"),
+            ((true, false, true), "enclave-egress-debug"),
+            ((false, true, true), "enclave-storage-egress"),
+            ((true, true, true), "enclave-storage-egress-debug"),
+        ];
+
+        for ((debug, storage, egress), expected) in cases {
+            assert_eq!(eif_target(debug, storage, egress), expected);
+        }
     }
 
     #[test]

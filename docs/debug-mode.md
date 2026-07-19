@@ -145,6 +145,15 @@ ownership now survives the deterministic tar-to-cpio handoff, so the builder
 no longer expands every capability set merely to compensate for files owned
 by the build user.
 
+## Egress feature gate
+
+The production recipe treats outbound networking as a measured build feature.
+Without `--egress-allowlist`, the EIF omits `enclavia-egress`, Unbound, full
+iproute2, and iptables; `init.sh` already skips all outbound setup when the
+egress daemon is absent. Supplying an allowlist selects the corresponding
+`-egress` flake target and includes the complete stack. Storage and debug mode
+remain orthogonal dimensions generated from the same Nix recipe.
+
 ## Test wrappers
 
 The flake exposes three QEMU wrappers that stand up a full debug
