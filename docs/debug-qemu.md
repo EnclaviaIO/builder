@@ -2,7 +2,7 @@
 
 QEMU 9.2+ includes a `nitro-enclave` machine type that can boot EIF images
 locally, without AWS hardware. This is useful for testing the full enclave
-boot sequence: kernel, init, NSM module, crun container launch, and
+boot sequence: kernel, init, built-in NSM driver, crun container launch, and
 enclavia-server startup.
 
 ## Prerequisites
@@ -94,9 +94,9 @@ while [ ! -S "${SOCK_DIR}/vhost.sock" ]; do sleep 0.1; done
 
 ### 2. Start the heartbeat responder
 
-The nitro-util init binary sends a heartbeat (byte `0xB7`) to CID 3, port
-9000 immediately after boot. On real AWS hardware, the Nitro hypervisor
-responds. In QEMU, we need to provide our own responder:
+The EIF's patched init sends a heartbeat byte (`0xB7`) to both the real
+Nitro parent (CID 3) and the QEMU host (CID 2), then continues with whichever
+valid response arrives. In QEMU, we provide that responder:
 
 ```bash
 python3 nix/heartbeat.py &
@@ -137,9 +137,8 @@ rm -rf "$SOCK_DIR"
 A successful boot looks like this (abbreviated):
 
 ```
-[    0.000000] Linux version 4.14.256 ...
+[    0.000000] Linux version <flake.lock-pinned maintained version> ...
 ...
-[    6.xxx] nsm: loading out-of-tree module taints kernel.
 [    6.xxx] NSM RNG: returning rand bytes = ...
 [    6.xxx] random: crng init done
 launched cmd=/bin/enclave-init
@@ -147,9 +146,9 @@ hello-server: starting on port 8080     # (or your app's output)
 ```
 
 Key milestones in order:
-1. **Kernel boot** — Linux 4.14 (from nitro-util blobs)
-2. **NSM module load** — provides `/dev/nsm` for attestation requests
-3. **Heartbeat** — init sends 0xB7 to CID 3:9000, waits for response
+1. **Kernel boot** — the minimal maintained kernel pinned by `flake.lock`
+2. **Built-in NSM probe** — provides `/dev/nsm` for attestation requests
+3. **Heartbeat** — init accepts the first valid CID 3 or CID 2 response
 4. **chroot** — init enters `/rootfs` (the enclave rootfs we built)
 5. **enclave-init** — our init script starts crun + enclavia-server
 6. **Customer container** — crun launches the OCI bundle
@@ -181,7 +180,7 @@ With the module loaded, connect to the guest CID (4 by default) on port 5000:
 
 ## Limitations
 
-- **NSM attestation is simulated** — the NSM module loads and `/dev/nsm`
+- **NSM attestation is simulated** — the built-in NSM driver creates `/dev/nsm`
   exists, but attestation documents contain synthetic data, not real
   hardware measurements. PCR values in the attestation won't match the
   build-time PCR values from `pcr.json`.

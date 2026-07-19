@@ -75,12 +75,13 @@ represented by the current initramfs format. See
 [builder#10](https://github.com/EnclaviaIO/builder/issues/10) for the original
 reproducibility history.
 
-The kernel and init blobs come from `nitro-util/blobs/x86_64/` (Linux
-4.14 for the base EIF, plus our `linuxManualConfig` kernel build for
-the storage-enabled variant). These are reproducible upstream: the
-flake's `nitro-util` input is pinned to a specific revision in
-`flake.lock`, so anyone rebuilding with the same lockfile gets the
-same blobs.
+Both EIF profiles build a purpose-specific kernel from
+`linuxPackages_latest`, pinned by the nixpkgs revision in `flake.lock`.
+The base profile no longer uses nitro-util's Linux 4.14 blob. The common
+`allnoconfig` policy and storage-only additions are resolved against that
+exact source and checked during the build; see [kernel.md](kernel.md).
+Every profile also uses the repository's pinned patched init, which can
+heartbeat either a real Nitro parent or the QEMU host.
 
 ## The flow
 

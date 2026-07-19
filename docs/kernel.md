@@ -12,7 +12,7 @@ distribution `.config`. `nix/kernel-config.nix` combines it with
 rather than taking new upstream defaults when the kernel is updated. The
 generator then fails if a requested option did not resolve, a forbidden option
 resolved to `y` or `m`, any module exists, or the resolved built-in count exceeds
-500 for base / 600 for storage.
+619 for base / 669 for storage.
 
 ## Required and retained capabilities
 
@@ -51,7 +51,7 @@ The policy rejects SELinux and the other heavyweight LSM/integrity stacks;
 NFS/NFSD and all other network filesystems; ext4, SquashFS, XFS, F2FS, FUSE and
 OverlayFS; IPv6 and IPv6 netfilter; nftables, conntrack, NAT and unused iptables
 tables/targets; PCI and physical network/storage drivers; KVM host support and
-32-bit ABIs; profiling, perf, tracing, probes, debugfs, symbols and sanitizers;
+32-bit ABIs; profiling, tracing, probes, debugfs, symbols and sanitizers;
 ORC/frame-pointer unwind metadata, io_uring/AIO/core dumps; and loadable
 modules. The zero-overhead guess unwinder remains for basic panic diagnostics.
 Only `RD_GZIP` is retained for initramfs input. `KERNEL_XZ` is independent: it
@@ -59,6 +59,12 @@ compresses the bzImage itself, not an initramfs. Kernel keyrings are also
 omitted; the storage init passes
 `--disable-keyring` to cryptsetup so its LUKS2 volume key goes directly to
 dm-crypt.
+
+Linux 7.1 requires the generic `PERF_EVENTS` core on x86 and selects the
+`DEBUG_KERNEL` umbrella when `EXPERT` exposes the minimal-policy controls.
+Those two symbols remain enabled so the supported x86 configuration compiles;
+the concrete profiling, tracing, debugfs, debug-info and sanitizer facilities
+remain disabled.
 
 Btrfs necessarily selects its on-disk checksum, RAID and zlib/LZO/Zstd
 compatibility helpers. dm-crypt similarly selects the crypto template helpers
@@ -106,27 +112,26 @@ nix run \
 
 ## Size accounting
 
-The previous storage config contained 1,016 built-ins and 44 modules. Each
-reviewed seed now requests 115 common built-ins plus 11 storage-only built-ins
+Each reviewed seed requests 119 common built-ins plus 11 storage-only built-ins
 and no modules. Those seed counts exclude dependencies selected by Kconfig, so
-each generated config records its authoritative resolved count and reduction in
+each generated config records its authoritative resolved count and budget in
 `result/report`. `nix build .#packages.x86_64-linux.kernel-size-report` also
 records both current bzImage and representative EIF byte sizes, plus the base
 kernel's reduction from the retired Linux 4.14 blob. Linux CI publishes this
 report in the job summary.
 
 Kernel and full-EIF before/after numbers must be taken from the same x86_64
-builder, nixpkgs lock, OCI bundle and input overrides. Build the baseline commit
-and this commit with distinct `-o` links, locate the baseline storage kernel in
+builder, nixpkgs lock, OCI bundle and input overrides. Build the earlier commit
+and this commit with distinct `-o` links, locate the earlier storage kernel in
 the EIF closure (`nix-store -qR <result>`, selecting the path containing
 `bzImage`), then produce the checked table with:
 
 ```sh
 sh nix/size-report.sh \
-  BASELINE_BASE/bzImage CURRENT_BASE/bzImage \
-  BASELINE_STORAGE/bzImage CURRENT_STORAGE/bzImage \
-  BASELINE_BASE/image.eif CURRENT_BASE/image.eif \
-  BASELINE_STORAGE/image.eif CURRENT_STORAGE/image.eif
+  BEFORE_BASE/bzImage AFTER_BASE/bzImage \
+  BEFORE_STORAGE/bzImage AFTER_STORAGE/bzImage \
+  BEFORE_BASE/image.eif AFTER_BASE/image.eif \
+  BEFORE_STORAGE/image.eif AFTER_STORAGE/image.eif
 ```
 
 Do not compare NAR closure sizes: the relevant attack-surface and delivery

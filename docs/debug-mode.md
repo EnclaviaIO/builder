@@ -21,16 +21,16 @@ no such notion.
 
 Debug mode addresses these by:
 
-1. Building the EIF with a patched init that targets CID 2 (the QEMU
-   host) instead of CID 3 (the Nitro parent).
+1. Using the same patched init as production. It heartbeats CID 3 (the Nitro
+   parent) and CID 2 (the QEMU host) concurrently and records the responder.
 2. Standing up `vhost-device-vsock` in UDS mode alongside QEMU so all
    vsock traffic flows through a directory of Unix sockets that host
    services can connect to without depending on the kernel's
    `vhost_vsock` module.
 
-Both choices are made at `builder build --debug` time. The production
-EIF (no `--debug`) ships an unmodified init and targets CID 3, and
-boots on real Nitro hardware. The same source tree builds both.
+`builder build --debug` changes the measured debug-attestation trust setting;
+it does not swap the kernel or init. Consequently the same purpose-built EIF
+boot path works on real Nitro and in the QEMU harness.
 
 ## Data path: router to guest
 
@@ -102,17 +102,12 @@ boot. On real hardware the Nitro parent replies with the same byte and
 init proceeds. Without that reply, init blocks forever and the enclave
 never starts.
 
-In QEMU there is no CID 3. vhost-device-vsock only handles CID 2. So the
-debug build ships a patched init that sends its heartbeat to CID 2
-instead. The patched init lives in [`nix/init-patched/`](../nix/init-patched/);
-it is a small Go reimplementation that is otherwise compatible with the
-upstream C init (and also handles kernel 6.8+, which exposes `nsm`
-in-tree rather than as an out-of-tree module).
-
-The flake builds the patched init only when an `enclave-debug` target
-is selected, and the builder CLI selects that target when invoked with
-`--debug`. Production EIFs (`enclave`, `enclave-storage`) ship the
-unmodified upstream init and target CID 3.
+In QEMU there is no CID 3 and vhost-device-vsock handles CID 2. The patched
+init in [`nix/init-patched/`](../nix/init-patched/) is a small Go
+reimplementation of the upstream init which sends to both CIDs and proceeds
+with the first reply. The flake ships it in debug and production EIFs. It also
+supports the maintained kernel's in-tree, built-in NSM driver, so no mismatched
+out-of-tree module is loaded.
 
 The host side of the heartbeat is `nix/heartbeat.py`. In UDS mode it
 listens on `${PROXY_SOCKET}_9000` and echoes the `0xB7` byte back.
@@ -124,12 +119,12 @@ bundle (using `umoci --rootless`), the resulting `config.json` is not
 directly usable inside the enclave. Two unrelated obstacles, both
 addressed in `patch_bundle_config` in `src/main.rs`:
 
-- **The enclave kernel lacks `CONFIG_CGROUP_NS`** and mount-namespace
-  creation fails on an initramfs root. Setting up any namespace at all
-  is therefore unreliable, and the namespaces that do work (PID, IPC,
-  UTS, user) add no value: the enclave is the security boundary, not
-  the container. The builder strips all entries from
-  `/linux/namespaces`.
+- **crun's mount-namespace setup fails on an initramfs root.** OCI PID, IPC,
+  UTS, time and user namespaces add no value because the enclave is the
+  security boundary, not the container. The builder therefore strips all
+  entries from `/linux/namespaces`. The kernel enables the namespace umbrella
+  only for `CONFIG_NET_NS`, used by init itself to isolate unbound; crun does
+  not create that namespace.
 
 - **`umoci --rootless` writes UID/GID mappings** that map container UID
   0 to the build user's UID (typically 1000). Inside the enclave the
@@ -137,7 +132,7 @@ addressed in `patch_bundle_config` in `src/main.rs`:
   The builder removes them.
 
 Several smaller patches travel with these for the same reason (no
-namespaces means no devpts, no UTS hostname, no per-container mounts):
+per-container devpts, no UTS hostname, no per-container mounts):
 `process.terminal` is forced to false, the hostname is dropped, and all
 mounts are stripped (the init script pre-mounts proc, dev, sys, tmp into the
 initramfs root). The image's capability sets are otherwise left intact. OCI

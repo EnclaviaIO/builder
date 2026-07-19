@@ -69,15 +69,16 @@ enum Cli {
         #[arg(long, default_value = "8080")]
         container_port: u16,
 
-        /// Build for debug mode (QEMU with patched init using CID 2)
+        /// Build with debug-attestation trust settings for local QEMU testing.
         #[arg(long)]
         debug: bool,
 
-        /// Build with persistent encrypted storage support (LUKS+btrfs over NBD).
+        /// Build with persistent encrypted storage support (LUKS+Btrfs over NBD).
         /// Switches the EIF target to `enclave-storage[-debug]`, which includes
-        /// a custom kernel with NBD + dm-crypt + btrfs and the enclavia-crypto
-        /// binary. The KMS key id is not baked into the EIF — enclavia-crypto
-        /// reads it from the bootstrap blob in the storage backing file.
+        /// the minimal storage kernel profile (NBD + dm-crypt + Btrfs) and the
+        /// enclavia-crypto binary. The KMS key id is not baked into the EIF —
+        /// enclavia-crypto reads it from the bootstrap blob in the storage
+        /// backing file.
         #[arg(long)]
         storage: bool,
 
