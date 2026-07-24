@@ -73,7 +73,13 @@ def parse_newc(payload: bytes) -> dict[str, dict[str, int | bytes]]:
 
 
 class TarToCpioTests(unittest.TestCase):
-    def make_archive(self, path: Path) -> None:
+    def make_archive(
+        self,
+        path: Path,
+        *,
+        link_before_target: bool = False,
+        link_after_target: bool = False,
+    ) -> None:
         with tarfile.open(path, "w", format=tarfile.PAX_FORMAT) as archive:
             for name in [
                 "rootfs",
@@ -96,7 +102,6 @@ class TarToCpioTests(unittest.TestCase):
             tool.gid = 456
             tool.mtime = 1
             tool.size = len(b"payload")
-            archive.addfile(tool, io.BytesIO(b"payload"))
 
             hardlink = tarfile.TarInfo("rootfs/var/lib/oci/bundle/tool-link")
             hardlink.type = tarfile.LNKTYPE
@@ -105,7 +110,24 @@ class TarToCpioTests(unittest.TestCase):
             hardlink.uid = tool.uid
             hardlink.gid = tool.gid
             hardlink.mtime = 1
-            archive.addfile(hardlink)
+
+            if link_before_target:
+                archive.addfile(hardlink)
+            archive.addfile(tool, io.BytesIO(b"payload"))
+            if not link_before_target:
+                archive.addfile(hardlink)
+
+            if link_after_target:
+                trailing_hardlink = tarfile.TarInfo(
+                    "rootfs/var/lib/oci/bundle/tool-link-after"
+                )
+                trailing_hardlink.type = tarfile.LNKTYPE
+                trailing_hardlink.linkname = tool.name
+                trailing_hardlink.mode = tool.mode
+                trailing_hardlink.uid = tool.uid
+                trailing_hardlink.gid = tool.gid
+                trailing_hardlink.mtime = 1
+                archive.addfile(trailing_hardlink)
 
             symlink = tarfile.TarInfo("rootfs/var/lib/oci/bundle/tool-symlink")
             symlink.type = tarfile.SYMTYPE
@@ -149,6 +171,12 @@ class TarToCpioTests(unittest.TestCase):
             self.assertEqual(tool["inode"], link["inode"])
             self.assertEqual(link["size"], 0)
 
+            names = list(entries)
+            self.assertLess(
+                names.index("rootfs/var/lib/oci/bundle/tool-link"),
+                names.index("rootfs/var/lib/oci/bundle/tool"),
+            )
+
             symlink = entries["rootfs/var/lib/oci/bundle/tool-symlink"]
             self.assertEqual(stat.S_IFMT(symlink["mode"]), stat.S_IFLNK)
             self.assertEqual((symlink["uid"], symlink["gid"]), (321, 654))
@@ -157,6 +185,42 @@ class TarToCpioTests(unittest.TestCase):
             device = entries["rootfs/var/lib/oci/bundle/device"]
             self.assertEqual(stat.S_IFMT(device["mode"]), stat.S_IFCHR)
             self.assertEqual((device["rdevmajor"], device["rdevminor"]), (10, 200))
+
+    def test_body_is_last_for_mixed_hardlink_input_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "link-before-target.tar"
+            self.make_archive(
+                archive,
+                link_before_target=True,
+                link_after_target=True,
+            )
+
+            output = io.BytesIO()
+            tar_to_cpio.convert(archive, output)
+            entries = parse_newc(output.getvalue())
+            group_names = [
+                name
+                for name in entries
+                if name.startswith("rootfs/var/lib/oci/bundle/tool")
+                and "symlink" not in name
+            ]
+
+            self.assertEqual(
+                group_names,
+                [
+                    "rootfs/var/lib/oci/bundle/tool-link",
+                    "rootfs/var/lib/oci/bundle/tool-link-after",
+                    "rootfs/var/lib/oci/bundle/tool",
+                ],
+            )
+            for name in group_names[:-1]:
+                self.assertEqual(entries[name]["size"], 0)
+                self.assertEqual(entries[name]["data"], b"")
+            self.assertEqual(entries[group_names[-1]]["data"], b"payload")
+
+            # A member following the reordered hardlink group still parses,
+            # guarding the cpio stream alignment as well as the file body.
+            self.assertIn("rootfs/var/lib/oci/bundle/device", entries)
 
     def test_paths_outside_rootfs_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

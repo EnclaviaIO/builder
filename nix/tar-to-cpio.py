@@ -131,14 +131,14 @@ def convert(input_path: os.PathLike[str] | str, output: BinaryIO) -> None:
     with tarfile.open(input_path, mode="r:") as archive:
         members = archive.getmembers()
         by_name: dict[str, tarfile.TarInfo] = {}
-        clean_names: dict[int, str] = {}
+        clean_names: dict[tarfile.TarInfo, str] = {}
 
         for member in members:
             name = _archive_name(member.name)
             if name in by_name:
                 raise ConversionError(f"duplicate tar entry: {name!r}")
             by_name[name] = member
-            clean_names[id(member)] = name
+            clean_names[member] = name
 
         def canonical(member: tarfile.TarInfo) -> tarfile.TarInfo:
             seen: set[str] = set()
@@ -157,25 +157,49 @@ def convert(input_path: os.PathLike[str] | str, output: BinaryIO) -> None:
             return current
 
         # newc represents hardlinks through equal (device, inode) tuples and a
-        # link count.  Tar represents them by path, so resolve and count every
+        # link count.  Tar represents them by path, so resolve and collect every
         # group before emitting the first member.
-        group_size: dict[str, int] = {}
+        groups: dict[str, list[tarfile.TarInfo]] = {}
+        root_for_member: dict[tarfile.TarInfo, tarfile.TarInfo] = {}
         for member in members:
             root = canonical(member)
-            root_name = clean_names[id(root)]
+            root_name = clean_names[root]
             if root.isdir() and member.islnk():
                 raise ConversionError(
                     f"hardlink {member.name!r} targets a directory"
                 )
-            group_size[root_name] = group_size.get(root_name, 0) + 1
+            root_for_member[member] = root
+            groups.setdefault(root_name, []).append(member)
+
+        # Linux's initramfs generators put the data on the final regular-file
+        # member in a hardlink group.  A tar archive instead puts the data on
+        # its canonical (non-LNKTYPE) member, which may occur anywhere in the
+        # input order.  Defer that member until the group's last input position
+        # so every zero-sized alias is emitted before the body-bearing member.
+        # This makes the newc stream independent of umoci's tar ordering.
+        deferred_roots: set[tarfile.TarInfo] = set()
+        root_after_member: dict[tarfile.TarInfo, tarfile.TarInfo] = {}
+        for group in groups.values():
+            root = root_for_member[group[0]]
+            if root.isfile() and len(group) > 1 and group[-1] is not root:
+                deferred_roots.add(root)
+                root_after_member[group[-1]] = root
+
+        emission_members: list[tarfile.TarInfo] = []
+        for member in members:
+            if member not in deferred_roots:
+                emission_members.append(member)
+            deferred_root = root_after_member.get(member)
+            if deferred_root is not None:
+                emission_members.append(deferred_root)
 
         inode_for_root: dict[str, int] = {}
         next_inode = 1
 
-        for member in members:
-            name = clean_names[id(member)]
-            root = canonical(member)
-            root_name = clean_names[id(root)]
+        for member in emission_members:
+            name = clean_names[member]
+            root = root_for_member[member]
+            root_name = clean_names[root]
             inode = inode_for_root.get(root_name)
             if inode is None:
                 inode = next_inode
@@ -183,12 +207,13 @@ def convert(input_path: os.PathLike[str] | str, output: BinaryIO) -> None:
                 inode_for_root[root_name] = inode
 
             # A tar hardlink has no independent inode metadata.  Use the
-            # canonical target's fields for every link name so the first name
-            # still creates the right inode even when it precedes the target.
+            # canonical target's fields for every link name; aliases are
+            # deliberately emitted before the target and therefore create the
+            # inode that the body-bearing final member populates.
             metadata = root if member.islnk() else member
             type_mode = _member_type(member, root)
             mode = type_mode | (metadata.mode & 0o7777)
-            nlink = group_size[root_name] if not root.isdir() else 1
+            nlink = len(groups[root_name]) if not root.isdir() else 1
 
             data: BinaryIO | None = None
             inline_data: bytes | None = None
