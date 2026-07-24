@@ -47,7 +47,10 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, nitro-util, oci-bundle, enclavia-crates, enclavia }:
-    flake-utils.lib.eachDefaultSystem (system:
+    # Building EIFs depends on Linux/x86_64-specific Nitro tooling. Restrict
+    # the output matrix so unsupported hosts fail during flake resolution,
+    # before evaluating the build dependency graph.
+    flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
         pkgs = import nixpkgs {
           overlays = [ rust-overlay.overlays.default ];
