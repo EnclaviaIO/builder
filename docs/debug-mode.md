@@ -105,9 +105,9 @@ never starts.
 In QEMU there is no CID 3 and vhost-device-vsock handles CID 2. The patched
 init in [`nix/init-patched/`](../nix/init-patched/) is a small Go
 reimplementation of the upstream init which sends to both CIDs and proceeds
-with the first reply. The flake ships it in debug and production EIFs. It also
-supports the maintained kernel's in-tree, built-in NSM driver, so no mismatched
-out-of-tree module is loaded.
+with the first reply. The flake ships it in every EIF. It also supports the
+maintained kernel's in-tree, built-in NSM driver, so no mismatched out-of-tree
+module is loaded.
 
 The host side of the heartbeat is `nix/heartbeat.py`. In UDS mode it
 listens on `${PROXY_SOCKET}_9000` and echoes the `0xB7` byte back.
@@ -146,8 +146,9 @@ The production recipe treats outbound networking as a measured build feature.
 Without `--egress-allowlist`, the EIF omits `enclavia-egress`, Unbound, full
 iproute2, and iptables; `init.sh` already skips all outbound setup when the
 egress daemon is absent. Supplying an allowlist selects the corresponding
-`-egress` flake target and includes the complete stack. Storage and debug mode
-remain orthogonal dimensions generated from the same Nix recipe.
+`-egress` flake target and includes the complete stack. Storage and egress are
+the Nix target dimensions; debug-attestation trust remains orthogonal because
+the builder writes it into the measured OCI payload before invoking Nix.
 
 ## Test wrappers
 

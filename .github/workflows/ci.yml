@@ -101,7 +101,7 @@ jobs:
           .#enclave-kernel-config
           .#enclave-storage-kernel-config
           .#test-enclave
-          .#test-enclave-storage-debug
+          .#test-enclave-storage
 
       - name: record kernel and EIF sizes
         run: |

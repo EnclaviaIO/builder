@@ -74,8 +74,8 @@ enum Cli {
         debug: bool,
 
         /// Build with persistent encrypted storage support (LUKS+Btrfs over NBD).
-        /// Switches the EIF target to `enclave-storage[-debug]`, which includes
-        /// the minimal storage kernel profile (NBD + dm-crypt + Btrfs) and the
+        /// Switches the EIF target to `enclave-storage`, which includes the
+        /// minimal storage kernel profile (NBD + dm-crypt + Btrfs) and the
         /// enclavia-crypto binary. The KMS key id is not baked into the EIF —
         /// enclavia-crypto reads it from the bootstrap blob in the storage
         /// backing file.
@@ -606,23 +606,18 @@ async fn create_bundle_archive(
 /// and `ENCLAVIA_FLAKE` env vars; in dev the flake's defaults (`./dummy-*`)
 /// are replaced by passing `--override-input enclavia-crates path:...`
 /// and `--override-input enclavia path:...` to the QEMU wrapper.
-fn eif_target(debug: bool, storage: bool, egress_enabled: bool) -> &'static str {
-    match (debug, storage, egress_enabled) {
-        (false, false, false) => "enclave",
-        (true, false, false) => "enclave-debug",
-        (false, true, false) => "enclave-storage",
-        (true, true, false) => "enclave-storage-debug",
-        (false, false, true) => "enclave-egress",
-        (true, false, true) => "enclave-egress-debug",
-        (false, true, true) => "enclave-storage-egress",
-        (true, true, true) => "enclave-storage-egress-debug",
+fn eif_target(storage: bool, egress_enabled: bool) -> &'static str {
+    match (storage, egress_enabled) {
+        (false, false) => "enclave",
+        (true, false) => "enclave-storage",
+        (false, true) => "enclave-egress",
+        (true, true) => "enclave-storage-egress",
     }
 }
 
 async fn build_eif(
     bundle_input_dir: &Path,
     result_link: &Path,
-    debug: bool,
     storage: bool,
     egress_enabled: bool,
 ) -> Result<()> {
@@ -645,7 +640,7 @@ async fn build_eif(
     // Storage variants add the custom kernel and storage userspace. Egress
     // variants add the outbound networking stack only when the caller supplied
     // an allowlist; deny-all images use the smaller default targets.
-    let target = eif_target(debug, storage, egress_enabled);
+    let target = eif_target(storage, egress_enabled);
     let flake_ref = format!("{}#{}", builder_dir.display(), target);
 
     let mut args: Vec<String> = vec![
@@ -1002,7 +997,6 @@ async fn build(
     build_eif(
         &bundle_input_dir,
         &result_link,
-        debug,
         storage,
         egress_allowlist.is_some(),
     )
@@ -1182,20 +1176,16 @@ mod tests {
     }
 
     #[test]
-    fn eif_targets_cover_storage_debug_and_egress_features() {
+    fn eif_targets_cover_storage_and_egress_features() {
         let cases = [
-            ((false, false, false), "enclave"),
-            ((true, false, false), "enclave-debug"),
-            ((false, true, false), "enclave-storage"),
-            ((true, true, false), "enclave-storage-debug"),
-            ((false, false, true), "enclave-egress"),
-            ((true, false, true), "enclave-egress-debug"),
-            ((false, true, true), "enclave-storage-egress"),
-            ((true, true, true), "enclave-storage-egress-debug"),
+            ((false, false), "enclave"),
+            ((true, false), "enclave-storage"),
+            ((false, true), "enclave-egress"),
+            ((true, true), "enclave-storage-egress"),
         ];
 
-        for ((debug, storage, egress), expected) in cases {
-            assert_eq!(eif_target(debug, storage, egress), expected);
+        for ((storage, egress), expected) in cases {
+            assert_eq!(eif_target(storage, egress), expected);
         }
     }
 

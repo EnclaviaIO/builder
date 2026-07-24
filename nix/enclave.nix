@@ -7,7 +7,6 @@
   # assembled by mkOciBundleArchive in flake.nix.
   ociBundleArchive,
   containerPort ? 8080,
-  debugMode ? false,
   nbdClientPkg ? null,
   enclaviaCryptoPkg ? null,
   enclaviaEgressPkg ? null,
@@ -326,8 +325,8 @@ let
   # records whichever answered to /run/enclavia-host-cid for the in-enclave
   # binaries to read (enclavia-vsock::host_cid). This is what lets
   # `enclavia reproduce` actually boot a Nitro-built image locally on QEMU,
-  # not just compare PCRs. (debugMode no longer affects the init; it only
-  # drives debug-attestation trust anchors in config.json.)
+  # not just compare PCRs. Debug-attestation trust is carried in the measured
+  # config.json supplied through the OCI bundle, not in this EIF recipe.
   initBinary = "${patchedInit}/bin/init";
 
   # nitro-util's ordinary buildEif path copies `copyToRoot` through two Nix

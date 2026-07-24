@@ -94,7 +94,7 @@ nix build .#packages.x86_64-linux.enclave-storage-kernel \
   -o result-storage-kernel
 nix build .#packages.x86_64-linux.test-enclave \
   -o result-base-eif
-nix build .#packages.x86_64-linux.test-enclave-storage-debug \
+nix build .#packages.x86_64-linux.test-enclave-storage \
   -o result-storage-eif
 ```
 

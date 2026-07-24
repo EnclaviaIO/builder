@@ -52,8 +52,8 @@ nix run .#debug-vm \
 
 The unsuffixed `enclave` target is the deny-all build and omits the egress
 stack. Direct flake builds that need outbound networking use `enclave-egress`
-or `enclave-egress-debug`; the builder CLI selects those targets automatically
-when `--egress-allowlist` is present.
+or `enclave-storage-egress`; the builder CLI selects the appropriate target
+automatically when `--egress-allowlist` is present.
 
 Both scripts accept optional positional arguments for memory and CPU count:
 

@@ -61,10 +61,9 @@ calling process can consume them directly.
 ## Flake outputs
 
 - `nix build .#builder`: the `builder` Rust binary itself.
-- `nix build .#enclave[-debug]` / `.#enclave-storage[-debug]`: build a
-  deny-all EIF without the egress stack. Add `-egress` before the optional
-  `-debug` suffix (`.#enclave-egress-debug`,
-  `.#enclave-storage-egress-debug`) to include outbound networking. Every
+- `nix build .#enclave` / `.#enclave-storage`: build a deny-all EIF
+  without the egress stack. Use `.#enclave-egress` or
+  `.#enclave-storage-egress` to include outbound networking. Every
   target consumes a deterministic OCI payload archive supplied as
   `bundle.tar` inside the directory passed via
   `--override-input oci-bundle path:<archive-input-dir>`; production callers

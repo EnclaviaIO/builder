@@ -94,12 +94,12 @@ heartbeat either a real Nitro parent or the QEMU host.
 
 2. **Rebuild the EIF locally.** The CLI invokes
    `nix build path:<builder-rev>#<eif-name>`. Storage adds `-storage`,
-   an allowlist adds `-egress`, and debug mode adds the final `-debug`
-   suffix, so the target name encodes the measured feature set. The CLI passes
-   `--override-input enclavia-crates path:<crates-rev>` and, for the
-   image input, a deterministic OCI payload archive produced from the
-   pinned digest. The builder binary is the same one the backend ran,
-   just driven by the CLI.
+   and an allowlist adds `-egress`, so the target name encodes the binary
+   feature set. Debug mode does not change the target: its attestation trust
+   setting is already encoded in the measured deterministic OCI payload. The
+   CLI passes `--override-input enclavia-crates path:<crates-rev>` and, for
+   the image input, that payload archive produced from the pinned digest. The
+   builder binary is the same one the backend ran, just driven by the CLI.
 
 3. **Compare PCRs.** The local rebuild produces a `pcr.json` next to
    the EIF. The CLI compares that against the PCRs the backend

@@ -205,7 +205,7 @@
           base_bytes=$(${pkgs.coreutils}/bin/stat -c %s ${enclaveKernel}/bzImage)
           storage_bytes=$(${pkgs.coreutils}/bin/stat -c %s ${storageKernel}/bzImage)
           base_eif_bytes=$(${pkgs.coreutils}/bin/stat -c %s ${test-enclave}/image.eif)
-          storage_eif_bytes=$(${pkgs.coreutils}/bin/stat -c %s ${test-enclave-storage-debug}/image.eif)
+          storage_eif_bytes=$(${pkgs.coreutils}/bin/stat -c %s ${test-enclave-storage}/image.eif)
           base_reduction=$((legacy_bytes - base_bytes))
           base_percent=$((base_reduction * 100 / legacy_bytes))
           {
@@ -226,37 +226,23 @@
         # Keep the production feature matrix in one recipe. The unsuffixed
         # targets are deny-all and contain no egress stack; `-egress` targets
         # opt in explicitly when the builder receives --egress-allowlist.
+        # Debug-attestation trust is encoded in the measured OCI payload
+        # before this recipe is called, so it is not a separate Nix target.
         mkProductionEnclave = {
-          debugMode ? false,
           storageEnabled ? false,
           egressEnabled ? false,
           rootfsOnly ? false,
         }: pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
-          inherit ociBundleArchive debugMode storageEnabled egressEnabled rootfsOnly;
+          inherit ociBundleArchive storageEnabled egressEnabled rootfsOnly;
           enclaviaEgressPkg = if egressEnabled then enclaviaEgressPkg else null;
           customKernel = if storageEnabled then storageKernel else enclaveKernel;
         };
 
         enclave = mkProductionEnclave { };
-        enclave-debug = mkProductionEnclave { debugMode = true; };
         enclave-storage = mkProductionEnclave { storageEnabled = true; };
-        enclave-storage-debug = mkProductionEnclave {
-          debugMode = true;
-          storageEnabled = true;
-        };
-
         enclave-egress = mkProductionEnclave { egressEnabled = true; };
-        enclave-egress-debug = mkProductionEnclave {
-          debugMode = true;
-          egressEnabled = true;
-        };
         enclave-storage-egress = mkProductionEnclave {
-          storageEnabled = true;
-          egressEnabled = true;
-        };
-        enclave-storage-egress-debug = mkProductionEnclave {
-          debugMode = true;
           storageEnabled = true;
           egressEnabled = true;
         };
@@ -412,18 +398,12 @@
         # dial vsock 5005, hit its 30s connect timeout, exit 1, and
         # `set -e` in init.sh would abort the boot. Reboot loop, CI
         # runner wedges until the workflow timeout kills it (~51 min
-        # observed). Sibling test enclaves (test-enclave-egress-debug,
-        # test-enclave-storage-debug, test-enclave-secrets-debug)
+        # observed). Sibling test enclaves (test-enclave-egress,
+        # test-enclave-storage, test-enclave-secrets)
         # already follow this pattern — they only inherit the packages
         # the scenario actually needs. Chain submission is exercised
         # via the production launcher in enclavia-crates, not via this
         # test wrapper.
-        test-enclave-debug = pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg;
-          ociBundleArchive = testBundleArchive;
-          debugMode = true;
-          customKernel = enclaveKernel;
-        };
 
         # --- WS test bundle + enclave ---
         # OCI bundle whose entrypoint is the `ws-echo-test` binary built
@@ -439,10 +419,9 @@
         };
         testWsBundleArchive = mkOciBundleArchive "test-ws-oci-bundle" test-ws-bundle;
 
-        test-enclave-ws-debug = pkgs.callPackage ./nix/enclave.nix {
+        test-enclave-ws = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg;
           ociBundleArchive = testWsBundleArchive;
-          debugMode = true;
           customKernel = enclaveKernel;
         };
 
@@ -453,10 +432,9 @@
         test-egress-bundle = pkgs.callPackage ./nix/test-egress-bundle.nix { inherit pkgs; };
         testEgressBundleArchive = mkOciBundleArchive "test-egress-oci-bundle" test-egress-bundle;
 
-        test-enclave-egress-debug = pkgs.callPackage ./nix/enclave.nix {
+        test-enclave-egress = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg enclaviaEgressPkg;
           ociBundleArchive = testEgressBundleArchive;
-          debugMode = true;
           egressEnabled = true;
           customKernel = enclaveKernel;
         };
@@ -471,10 +449,9 @@
         test-secrets-bundle = pkgs.callPackage ./nix/test-secrets-bundle.nix { inherit pkgs; };
         testSecretsBundleArchive = mkOciBundleArchive "test-secrets-oci-bundle" test-secrets-bundle;
 
-        test-enclave-secrets-debug = pkgs.callPackage ./nix/enclave.nix {
+        test-enclave-secrets = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg enclaviaSecretsInitPkg;
           ociBundleArchive = testSecretsBundleArchive;
-          debugMode = true;
           customKernel = enclaveKernel;
         };
 
@@ -482,7 +459,7 @@
         test-storage-bundle = pkgs.callPackage ./nix/test-storage-bundle.nix { inherit pkgs; };
         testStorageBundleArchive = mkOciBundleArchive "test-storage-oci-bundle" test-storage-bundle;
 
-        test-enclave-storage-debug = pkgs.callPackage ./nix/enclave.nix {
+        test-enclave-storage = pkgs.callPackage ./nix/enclave.nix {
           # enclaviaSecretsInitPkg is baked in here (unlike the other
           # test EIFs) because the storage path runs `enclavia-crypto
           # init`, which on real Nitro needs AWS_* creds pulled by
@@ -491,7 +468,6 @@
           # that pull -> source -> scrub flow with static dummy creds.
           inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaSecretsInitPkg;
           ociBundleArchive = testStorageBundleArchive;
-          debugMode = true;
           storageEnabled = true;
           customKernel = storageKernel;
         };
@@ -499,10 +475,9 @@
         # Diagnostic variant: storage path skips LUKS so the proxy is exercised
         # against raw btrfs writes. Used to isolate proxy throughput from
         # cryptsetup overhead on TCG.
-        test-enclave-storage-debug-no-luks = pkgs.callPackage ./nix/enclave.nix {
+        test-enclave-storage-no-luks = pkgs.callPackage ./nix/enclave.nix {
           inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg;
           ociBundleArchive = testStorageBundleArchive;
-          debugMode = true;
           storageEnabled = true;
           skipLuks = true;
           customKernel = storageKernel;
@@ -518,10 +493,10 @@
           # straight on /dev/nbd0, bypassing cryptsetup. Used to isolate the
           # NBD proxy's behaviour from LUKS overhead on TCG.
           if [ "''${NO_LUKS:-0}" = "1" ]; then
-              EIF_PATH="${test-enclave-storage-debug-no-luks}/image.eif"
+              EIF_PATH="${test-enclave-storage-no-luks}/image.eif"
               echo "storage-test-vm: NO_LUKS=1 → using LUKS-bypass EIF"
           else
-              EIF_PATH="${test-enclave-storage-debug}/image.eif"
+              EIF_PATH="${test-enclave-storage}/image.eif"
           fi
           MEMORY="''${1:-4G}"
           CPUS="''${2:-2}"
@@ -784,7 +759,7 @@
         test-egress-vm = pkgs.writeShellScriptBin "enclavia-test-egress-vm" ''
           set -euo pipefail
 
-          EIF_PATH="${test-enclave-egress-debug}/image.eif"
+          EIF_PATH="${test-enclave-egress}/image.eif"
           MEMORY="''${MEMORY:-4G}"
           CPUS="''${CPUS:-2}"
 
@@ -902,7 +877,7 @@
         test-secrets-vm = pkgs.writeShellScriptBin "enclavia-test-secrets-vm" ''
           set -euo pipefail
 
-          EIF_PATH="${test-enclave-secrets-debug}/image.eif"
+          EIF_PATH="${test-enclave-secrets}/image.eif"
           MEMORY="''${MEMORY:-4G}"
           CPUS="''${CPUS:-2}"
 
@@ -1076,7 +1051,7 @@
         };
 
         packages = {
-          inherit builder enclave enclave-debug enclave-egress enclave-egress-debug enclave-storage enclave-storage-debug enclave-storage-egress enclave-storage-egress-debug debug-vm test-bundle test-enclave test-enclave-debug test-debug-vm test-storage-bundle test-enclave-storage-debug test-enclave-storage-debug-no-luks test-storage-vm test-egress-bundle test-enclave-egress-debug test-egress-vm test-ws-bundle test-enclave-ws-debug test-secrets-bundle test-enclave-secrets-debug test-secrets-vm;
+          inherit builder enclave enclave-egress enclave-storage enclave-storage-egress debug-vm test-bundle test-enclave test-debug-vm test-storage-bundle test-enclave-storage test-enclave-storage-no-luks test-storage-vm test-egress-bundle test-enclave-egress test-egress-vm test-ws-bundle test-enclave-ws test-secrets-bundle test-enclave-secrets test-secrets-vm;
           enclave-kernel = enclaveKernel;
           enclave-storage-kernel = storageKernel;
           enclave-kernel-config = enclaveKernelConfig;
