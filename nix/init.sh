@@ -488,7 +488,10 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
         /bin/mount -o noatime,noexec,nosuid,nodev /dev/nbd0 /data
         echo "storage: btrfs mounted at /data (LUKS bypassed, diagnostic mode)"
         /bin/mkdir -p "$ROOTFS/data"
-        /bin/mount --bind /data "$ROOTFS/data" 2>/dev/null || true
+        if ! /bin/mount --bind /data "$ROOTFS/data"; then
+            echo "ERROR: failed to bind persistent /data into the workload rootfs; aborting boot" >&2
+            exit 1
+        fi
     else
         # --- AWS credentials for the in-enclave KMS call (#199 / #198) ---
         # `enclavia-crypto init` below talks to KMS using in-enclave TLS
@@ -589,7 +592,10 @@ if [ "$STORAGE_ENABLED" = "true" ]; then
 
         # Bind-mount into container rootfs so the app can access it
         /bin/mkdir -p "$ROOTFS/data"
-        /bin/mount --bind /data "$ROOTFS/data" 2>/dev/null || true
+        if ! /bin/mount --bind /data "$ROOTFS/data"; then
+            echo "ERROR: failed to bind persistent /data into the workload rootfs; aborting boot" >&2
+            exit 1
+        fi
     fi
 fi
 
