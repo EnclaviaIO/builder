@@ -270,6 +270,13 @@ if [ -x /bin/enclavia-egress ]; then
         # the auto-injected resolver:53 entries. Exported here so it is
         # in the daemon's environment when it starts below.
         export EGRESS_TRUSTED_SRC="$RESOLVER_IP"
+        # Once unbound is isolated in the resolver netns it no longer
+        # listens on the daemon's loopback, so the daemon must query it
+        # at the resolver-netns address for hostname-allowlist
+        # enforcement. Without this the daemon falls back to 127.0.0.1:53
+        # (nothing there post-split), every hostname lookup fails, and
+        # the fail-closed policy denies every hostname-allowlisted flow.
+        export EGRESS_UNBOUND_ADDR="${RESOLVER_IP}:53"
         ISOLATED_UNBOUND=1
 
         # Start unbound INSIDE the resolver netns (net ns only, via
