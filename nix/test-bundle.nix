@@ -13,8 +13,14 @@ let
         "/bin/sh" "-c"
         ''
           echo 'hello-server: starting on port 8080'
+          # busybox nc has no `-q`: it rejects the flag and exits before ever
+          # listening, so keep the invocation to flags busybox supports. Each
+          # iteration serves one connection (nc exits when the HTTP/1.0 client
+          # closes after reading the response). Leave nc's stderr visible on
+          # the console so a bad invocation fails loudly instead of silently
+          # breaking the loop and leaving the port refusing connections.
           while true; do
-            echo -e 'HTTP/1.1 200 OK\r\nContent-Length: 13\r\nContent-Type: text/plain\r\n\r\nHello, world!' | nc -l -p 8080 -q 0 2>/dev/null || break
+            echo -e 'HTTP/1.1 200 OK\r\nContent-Length: 13\r\nContent-Type: text/plain\r\n\r\nHello, world!' | nc -l -p 8080 || break
           done
         ''
       ];
