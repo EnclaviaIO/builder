@@ -39,10 +39,13 @@
     # Override during local development with
     # `--override-input enclavia path:../enclavia`.
     enclavia = {
-      # Pinned to EnclaviaIO/enclavia master after #76, which builds the
-      # customer-enclave binaries as fully static musl executables. This
-      # avoids pulling glibc and libgcc into the measured initramfs.
-      url = "github:EnclaviaIO/enclavia/b414ec0334594b390b98c1157cd1cc2537827e28";
+      # Pinned to the EnclaviaIO/enclavia `monitor-daemon` branch head
+      # (PR #95), which adds the in-enclave `enclavia-monitor` telemetry
+      # daemon baked into the EIF below. TEMPORARY: re-pin to the master
+      # merge commit once #95 lands. Like the previous pin (#76), all
+      # customer-enclave binaries build as fully static musl executables,
+      # keeping glibc and libgcc out of the measured initramfs.
+      url = "github:EnclaviaIO/enclavia/ab1b76f83c7ff0072d9c78bafcfe670004caada1";
     };
   };
 
@@ -111,6 +114,7 @@
         enclaviaEgressPkg = enclavia.packages.${system}.enclavia-egress;
         enclaviaSecretsInitPkg = enclavia.packages.${system}.enclavia-secrets-init;
         enclaviaChainInitPkg = enclavia.packages.${system}.enclavia-chain-init;
+        enclaviaMonitorPkg = enclavia.packages.${system}.enclavia-monitor;
         mockKmsPkg = enclavia.packages.${system}.mock-kms;
         nitroLib = nitro-util.lib.${system};
 
@@ -184,7 +188,7 @@
           egressEnabled ? false,
           rootfsOnly ? false,
         }: pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
+          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaSecretsInitPkg enclaviaChainInitPkg enclaviaMonitorPkg;
           inherit ociBundleArchive debugMode storageEnabled egressEnabled rootfsOnly;
           enclaviaEgressPkg = if egressEnabled then enclaviaEgressPkg else null;
           customKernel = if storageEnabled then storageKernel else null;

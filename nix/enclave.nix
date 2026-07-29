@@ -22,6 +22,11 @@
   # the same reason as enclaviaSecretsInitPkg: hand-built test EIFs
   # may skip it, but every real-enclave variant passes it in.
   enclaviaChainInitPkg ? null,
+  # In-enclave telemetry + graceful-flush daemon. Optional for the same
+  # reason as enclaviaSecretsInitPkg: hand-built test EIFs may skip it,
+  # but every real-enclave variant passes it in (both storage and
+  # non-storage; the daemon simply omits disk stats without a mount).
+  enclaviaMonitorPkg ? null,
   storageEnabled ? false,
   customKernel ? null,
   # CI size checks need the builder-owned, uncompressed runtime rootfs without
@@ -163,6 +168,16 @@ let
     cp ${enclaviaChainInitPkg}/bin/enclavia-chain-init $out/bin/
     '' else ""}
 
+    ${if enclaviaMonitorPkg != null then ''
+    # In-enclave monitor daemon: workload liveness/health + disk-usage
+    # telemetry (guest->host vsock 5014) and the flush-before-shutdown
+    # listener (vsock 5015). init.sh backgrounds it right after the
+    # workload container starts; a monitor crash never takes down the
+    # enclave, and an absent host-side collector only means dropped
+    # samples (the daemon logs and keeps looping).
+    cp ${enclaviaMonitorPkg}/bin/enclavia-monitor $out/bin/
+    '' else ""}
+
     # Minimal busybox for networking setup (ip link set lo up)
     cp ${pkgs.pkgsStatic.busybox}/bin/busybox $out/bin/busybox
     ln -s busybox $out/bin/ip
@@ -288,6 +303,7 @@ let
       enclavia-server \
       enclavia-secrets-init \
       enclavia-chain-init \
+      enclavia-monitor \
       enclavia-nbd-client \
       enclavia-crypto \
       enclavia-egress \
