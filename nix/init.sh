@@ -683,5 +683,36 @@ fi
 # --no-pivot: use chroot instead of pivot_root (required on initramfs)
 /bin/crun run --no-pivot --bundle /var/lib/oci/bundle customer &
 
+# --- In-enclave monitor daemon ---
+# Started right after the workload so its liveness probes have something
+# to observe. It samples workload liveness (TCP connect to
+# 127.0.0.1:$WORKLOAD_PORT, plus GET $HEALTH_PATH when set) and disk
+# usage of $DATA_MOUNT (silently absent when nothing is mounted there,
+# so non-storage enclaves need no special casing), ships one sample per
+# tick to the host over vsock 5014, and listens on vsock 5015 for the
+# host's flush-before-shutdown command. Backgrounded with its own log
+# like the sibling daemons (egress, unbound): a monitor crash must never
+# take down the enclave, and a backgrounded command cannot trip `set -e`.
+# An absent host-side collector only means dropped samples; the daemon
+# logs and keeps looping rather than exiting.
+if [ -x /bin/enclavia-monitor ]; then
+    # HEALTH_PATH comes from the measured config's customer_app.health_check
+    # (an absolute HTTP path like "/health"). Guard on the leading slash so
+    # a malformed value degrades to liveness-only probing instead of a
+    # nonsense URL; unset/empty means no HTTP probe.
+    MONITOR_HEALTH_PATH=""
+    if [ -f "$CONFIG" ]; then
+        MONITOR_HEALTH_PATH="$(/bin/jq -r '.customer_app.health_check // empty | select(startswith("/"))' "$CONFIG" 2>/dev/null || true)"
+    fi
+    if [ -n "$MONITOR_HEALTH_PATH" ]; then
+        WORKLOAD_PORT="$CONTAINER_PORT" HEALTH_PATH="$MONITOR_HEALTH_PATH" DATA_MOUNT=/data \
+            /bin/enclavia-monitor >/tmp/monitor.log 2>&1 &
+    else
+        WORKLOAD_PORT="$CONTAINER_PORT" DATA_MOUNT=/data \
+            /bin/enclavia-monitor >/tmp/monitor.log 2>&1 &
+    fi
+    echo "monitor: started (port ${CONTAINER_PORT}, health path '${MONITOR_HEALTH_PATH:-none}')"
+fi
+
 # Start enclavia-server in the foreground, forwarding to the customer's port
 exec /bin/enclavia-server --container-addr "127.0.0.1:${CONTAINER_PORT}"
