@@ -52,8 +52,8 @@ if [ ! -S "${VHOST_SOCKET}" ]; then
 fi
 
 # --- 2. Start heartbeat responder ---
-# The enclave init sends 0xB7 to CID 3 port 9000 and expects 0xB7 back.
-# Listens on AF_VSOCK (VMADDR_CID_ANY, port 9000).
+# The enclave init sends 0xB7 to both Nitro CID 3 and QEMU CID 2 on port 9000,
+# then accepts the first valid echo. Listen on AF_VSOCK here for the QEMU path.
 echo "debug-run: starting heartbeat responder..."
 python3 "${SCRIPT_DIR}/heartbeat.py" &
 HEARTBEAT_PID=$!

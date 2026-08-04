@@ -75,12 +75,13 @@ represented by the current initramfs format. See
 [builder#10](https://github.com/EnclaviaIO/builder/issues/10) for the original
 reproducibility history.
 
-The kernel and init blobs come from `nitro-util/blobs/x86_64/` (Linux
-4.14 for the base EIF, plus our `linuxManualConfig` kernel build for
-the storage-enabled variant). These are reproducible upstream: the
-flake's `nitro-util` input is pinned to a specific revision in
-`flake.lock`, so anyone rebuilding with the same lockfile gets the
-same blobs.
+Both EIF profiles build a purpose-specific kernel from
+`linuxPackages_latest`, pinned by the nixpkgs revision in `flake.lock`.
+The base profile no longer uses nitro-util's Linux 4.14 blob. The common
+`allnoconfig` policy and storage-only additions are resolved against that
+exact source and checked during the build; see [kernel.md](kernel.md).
+Every profile also uses the repository's pinned patched init, which can
+heartbeat either a real Nitro parent or the QEMU host.
 
 ## The flow
 
@@ -93,12 +94,12 @@ same blobs.
 
 2. **Rebuild the EIF locally.** The CLI invokes
    `nix build path:<builder-rev>#<eif-name>`. Storage adds `-storage`,
-   an allowlist adds `-egress`, and debug mode adds the final `-debug`
-   suffix, so the target name encodes the measured feature set. The CLI passes
-   `--override-input enclavia-crates path:<crates-rev>` and, for the
-   image input, a deterministic OCI payload archive produced from the
-   pinned digest. The builder binary is the same one the backend ran,
-   just driven by the CLI.
+   and an allowlist adds `-egress`, so the target name encodes the binary
+   feature set. Debug mode does not change the target: its attestation trust
+   setting is already encoded in the measured deterministic OCI payload. The
+   CLI passes `--override-input enclavia-crates path:<crates-rev>` and, for
+   the image input, that payload archive produced from the pinned digest. The
+   builder binary is the same one the backend ran, just driven by the CLI.
 
 3. **Compare PCRs.** The local rebuild produces a `pcr.json` next to
    the EIF. The CLI compares that against the PCRs the backend

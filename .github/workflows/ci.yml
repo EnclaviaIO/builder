@@ -90,3 +90,27 @@ jobs:
 
           check_rootfs_size base
           check_rootfs_size storage
+
+      # Resolve both allnoconfig policies (including forbidden-option/count
+      # assertions), compile both kernels, and assemble representative EIFs.
+      # Runtime boot/I/O coverage remains in the enclavia-crates QEMU e2e
+      # harnesses documented in docs/kernel.md.
+      - name: build base and storage EIF profiles
+        run: >-
+          nix build --no-link
+          .#enclave-kernel-config
+          .#enclave-storage-kernel-config
+          .#test-enclave
+          .#test-enclave-storage
+
+      - name: record kernel and EIF sizes
+        run: |
+          nix build .#kernel-size-report -o result-kernel-size-report
+          {
+            echo '### Enclave kernel size report'
+            echo '```text'
+            cat result-kernel-size-report/report
+            cat result-kernel-size-report/base-config-report
+            cat result-kernel-size-report/storage-config-report
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

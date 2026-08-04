@@ -38,8 +38,8 @@ Flags (see `src/main.rs` for the source of truth):
 | `--registry-token` | Pre-minted bearer token; bypasses the auth realm round-trip. Mutually exclusive with the user/password pair. |
 | `--output-dir` | Directory to write `image.eif` and `pcr.json` (default `./out`). |
 | `--container-port` | Port the customer's container listens on inside the enclave (default `8080`). |
-| `--debug` | Build for debug mode (QEMU with patched init using CID 2). See [docs/debug-mode.md](docs/debug-mode.md). |
-| `--storage` | Build the storage-capable variant (LUKS + btrfs over NBD over vsock). Pulls in a custom kernel + `enclavia-crypto`. |
+| `--debug` | Build with debug-attestation trust anchors for local QEMU testing. All profiles use the same dual Nitro/QEMU heartbeat init. See [docs/debug-mode.md](docs/debug-mode.md). |
+| `--storage` | Build the storage-capable variant (LUKS + Btrfs over NBD over vsock). Adds the minimal storage kernel profile and `enclavia-crypto`. |
 | `--control-pubkey` | Base64-encoded ECDSA P-256 public key (65 raw bytes, uncompressed SEC1) for the management control channel. |
 | `--enclave-id` | Per-enclave identifier stamped into `enclavia-config.json`, so two enclaves built from identical inputs still get distinct PCRs. |
 | `--image-digest` | Registry manifest digest (`sha256:<hex>`) of the image being built, stamped into `enclavia-config.json` for the in-enclave chain-init helper. |
@@ -61,14 +61,17 @@ calling process can consume them directly.
 ## Flake outputs
 
 - `nix build .#builder`: the `builder` Rust binary itself.
-- `nix build .#enclave[-debug]` / `.#enclave-storage[-debug]`: build a
-  deny-all EIF without the egress stack. Add `-egress` before the optional
-  `-debug` suffix (`.#enclave-egress-debug`,
-  `.#enclave-storage-egress-debug`) to include outbound networking. Every
+- `nix build .#enclave` / `.#enclave-storage`: build a deny-all EIF
+  without the egress stack. Use `.#enclave-egress` or
+  `.#enclave-storage-egress` to include outbound networking. Every
   target consumes a deterministic OCI payload archive supplied as
   `bundle.tar` inside the directory passed via
   `--override-input oci-bundle path:<archive-input-dir>`; production callers
   go through the `builder` CLI rather than invoking the flake directly.
+- `nix build .#enclave-kernel[-config]` /
+  `.#enclave-storage-kernel[-config]`: build or audit the two minimal
+  kernel profiles. `.#kernel-size-report` records resolved option counts
+  and bzImage sizes.
 - `nix build .#test-debug-vm`: a wrapper that launches a minimal
   busybox-HTTP test enclave under QEMU with vhost-device-vsock
   stitched in. Used by the router e2e tests.
@@ -81,7 +84,9 @@ calling process can consume them directly.
 
 See [docs/debug-mode.md](docs/debug-mode.md) for the architecture
 behind the QEMU wrappers and [docs/reproduce.md](docs/reproduce.md)
-for the reproducibility story.
+for the reproducibility story. The reviewed kernel capabilities,
+exclusions, verification and size-accounting procedure are in
+[docs/kernel.md](docs/kernel.md).
 
 ## License
 
