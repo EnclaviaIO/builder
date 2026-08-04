@@ -36,6 +36,17 @@ let
   arch = "x86_64";
   blobs = nitroLib.blobs.${arch};
 
+  # libbsd's explicit_bzero check aborts intermittently when the static
+  # (musl) variant is built from source on some build hosts; the library
+  # itself is unaffected. Skip its test suite in the static package set
+  # only, so the binary-cached native libbsd (and its dependents) keep
+  # their store paths.
+  pkgsStatic = pkgs.pkgsStatic.extend (
+    final: prev: {
+      libbsd = prev.libbsd.overrideAttrs (_: { doCheck = false; });
+    }
+  );
+
   # The init for ALL EIFs (debug and prod alike). Unlike AWS' stock blob
   # init (which heartbeats only the Nitro parent at CID 3 and can't be
   # modified), this one we control: it heartbeats BOTH CID 3 and CID 2
@@ -87,7 +98,7 @@ let
   # nixpkgs so it drops cleanly into the initramfs with no shared-library
   # closure to ship. The DNSSEC trust anchor and the runtime-substituted
   # config template live next to it on the rootfs.
-  unboundPkg = pkgs.pkgsStatic.unbound;
+  unboundPkg = pkgsStatic.unbound;
   unboundConfTemplate = ./unbound.conf.template;
   # IANA DNSSEC root trust anchor, vendored from nixpkgs.dns-root-data.
   # Vendoring rather than fetching at boot is intentional: the anchor
@@ -104,7 +115,7 @@ let
   # cgroup support and the krun handler disabled turns a ~300 MiB
   # closure into one ~2 MiB self-contained binary.
   crunMinimal =
-    (pkgs.pkgsStatic.crun.override {
+    (pkgsStatic.crun.override {
       withLibkrun = false;
       withLibkrunSEV = false;
       # Null buildInputs are skipped by mkDerivation; configure then
@@ -114,7 +125,7 @@ let
     }).overrideAttrs (old: {
       # musl has no argp; crun's option parser needs the standalone lib.
       buildInputs = (old.buildInputs or [ ]) ++ [
-        pkgs.pkgsStatic.argp-standalone
+        pkgsStatic.argp-standalone
       ];
       # The stock derivation force-links criu.
       env = (old.env or { }) // { NIX_LDFLAGS = ""; };
@@ -164,7 +175,7 @@ let
     '' else ""}
 
     # Minimal busybox for networking setup (ip link set lo up)
-    cp ${pkgs.pkgsStatic.busybox}/bin/busybox $out/bin/busybox
+    cp ${pkgsStatic.busybox}/bin/busybox $out/bin/busybox
     ln -s busybox $out/bin/ip
     ln -s busybox $out/bin/mount
     ln -s busybox $out/bin/mkdir
@@ -188,7 +199,7 @@ let
     # works but is fragile on single-line JSON (the original awk
     # forwarded-scoped resolvers list also matched IPs from the egress
     # array). jq's grammar makes the queries explicit and short.
-    cp ${pkgs.pkgsStatic.jq}/bin/jq $out/bin/jq
+    cp ${pkgsStatic.jq}/bin/jq $out/bin/jq
 
     ${if storageEnabled && nbdClientPkg != null then ''
     # NBD client for enclave storage. The client also acts as a userspace
@@ -202,9 +213,9 @@ let
     '' else throw "enclaviaCryptoPkg is required when storageEnabled = true"}
 
     # cryptsetup (dm-crypt / LUKS2) and btrfs userspace.
-    cp ${pkgs.pkgsStatic.cryptsetup}/bin/cryptsetup $out/bin/
-    cp ${pkgs.pkgsStatic.btrfs-progs}/bin/mkfs.btrfs $out/bin/
-    cp ${pkgs.pkgsStatic.util-linux}/bin/blkid $out/bin/
+    cp ${pkgsStatic.cryptsetup}/bin/cryptsetup $out/bin/
+    cp ${pkgsStatic.btrfs-progs}/bin/mkfs.btrfs $out/bin/
+    cp ${pkgsStatic.util-linux}/bin/blkid $out/bin/
     '' else ""}
 
     ${if egressEnabled then
@@ -232,7 +243,7 @@ let
     # veth + netns setup; the existing lo/tun0 commands stay on
     # busybox `ip`. Named distinctly to avoid changing the busybox
     # applet the rest of init.sh relies on.
-    cp ${pkgs.pkgsStatic.iproute2}/bin/ip $out/bin/iproute2-ip
+    cp ${pkgsStatic.iproute2}/bin/ip $out/bin/iproute2-ip
 
     # Static legacy iptables (xtables-legacy backend; the enclave
     # kernel builds CONFIG_IP_NF_IPTABLES/FILTER, not nf_tables). One
@@ -241,7 +252,7 @@ let
     # hardening). The
     # multiplexer dispatches on argv0, so the `iptables` symlink
     # selects the legacy applet.
-    cp ${pkgs.pkgsStatic.iptables}/bin/xtables-legacy-multi $out/bin/
+    cp ${pkgsStatic.iptables}/bin/xtables-legacy-multi $out/bin/
     ln -s xtables-legacy-multi $out/bin/iptables
     '' else ""}
 
@@ -266,7 +277,7 @@ let
       echo "enclave-rootfs: /etc/enclavia/config.json is missing or empty in the measured rootfs" >&2
       exit 1
     fi
-    if ! ${pkgs.pkgsStatic.jq}/bin/jq -e '
+    if ! ${pkgsStatic.jq}/bin/jq -e '
       type == "object" and
       (if has("synchronizer") then
         (.synchronizer.expected_pcrs | type == "array" and length > 0)
