@@ -33,7 +33,7 @@ Flags (see `src/main.rs` for the source of truth):
 
 | Flag | Purpose |
 |------|---------|
-| `--image` | Docker image reference to pull (registry/repo:tag). |
+| `--image` | Image to build. A plain reference (registry/repo:tag) is pulled from its registry. An explicit skopeo transport selects a non-registry source instead — `docker-daemon:app:tag`, `docker-archive:app.tar`, `oci:dir`, `oci-archive:file`, `containers-storage:` — used by `enclavia build` for local CI builds; these reject the registry auth flags and skip digest pinning. |
 | `--registry-user`, `--registry-password` | HTTP Basic credentials for the source registry. |
 | `--registry-token` | Pre-minted bearer token; bypasses the auth realm round-trip. Mutually exclusive with the user/password pair. |
 | `--output-dir` | Directory to write `image.eif` and `pcr.json` (default `./out`). |
