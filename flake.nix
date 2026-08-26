@@ -39,10 +39,10 @@
     # Override during local development with
     # `--override-input enclavia path:../enclavia`.
     enclavia = {
-      # Pinned to EnclaviaIO/enclavia master after #76, which builds the
-      # customer-enclave binaries as fully static musl executables. This
-      # avoids pulling glibc and libgcc into the measured initramfs.
-      url = "github:EnclaviaIO/enclavia/b414ec0334594b390b98c1157cd1cc2537827e28";
+      # Pinned to EnclaviaIO/enclavia master after #113 (Noise exact-size
+      # framing + VerificationMode), picking up the #97..#113 hardening
+      # series for e2e validation against the control plane.
+      url = "github:EnclaviaIO/enclavia/af93a8522517d6f9d5b1634c4bfcc765949ba71a";
     };
   };
 

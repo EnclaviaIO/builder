@@ -3,11 +3,11 @@
     "builder-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1781017065,
-        "narHash": "sha256-YVgmsbW0DrMN3cUc+BZRJp7iscdVReIP7o5PtAv3IuI=",
+        "lastModified": 1783697223,
+        "narHash": "sha256-7lnyiIYNhO7jF+9FK87TMdiFH9WCkXh3/M+5oKM2Z/E=",
         "owner": "EnclaviaIO",
         "repo": "builder",
-        "rev": "2b551d80b5013f53716f714791e649350b8e9ea4",
+        "rev": "be630db4854eb6154a4c4cfaf2e20f2202a22f35",
         "type": "github"
       },
       "original": {
@@ -56,17 +56,17 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1783713734,
-        "narHash": "sha256-Sh0ap40/RtRe+4nSrbdM1eqdC1WzuMlEJpcz7F0csPQ=",
+        "lastModified": 1787744721,
+        "narHash": "sha256-We98hhSpzEn6PikhByABi4HOAYyE2KUNh6yxSckXXGY=",
         "owner": "EnclaviaIO",
         "repo": "enclavia",
-        "rev": "b414ec0334594b390b98c1157cd1cc2537827e28",
+        "rev": "af93a8522517d6f9d5b1634c4bfcc765949ba71a",
         "type": "github"
       },
       "original": {
         "owner": "EnclaviaIO",
         "repo": "enclavia",
-        "rev": "b414ec0334594b390b98c1157cd1cc2537827e28",
+        "rev": "af93a8522517d6f9d5b1634c4bfcc765949ba71a",
         "type": "github"
       }
     },
