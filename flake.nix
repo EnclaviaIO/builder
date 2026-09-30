@@ -39,10 +39,10 @@
     # Override during local development with
     # `--override-input enclavia path:../enclavia`.
     enclavia = {
-      # Pinned to EnclaviaIO/enclavia master after #76, which builds the
-      # customer-enclave binaries as fully static musl executables. This
-      # avoids pulling glibc and libgcc into the measured initramfs.
-      url = "github:EnclaviaIO/enclavia/b414ec0334594b390b98c1157cd1cc2537827e28";
+      # Pinned to EnclaviaIO/enclavia master after #113 (Noise exact-size
+      # framing + VerificationMode), picking up the #97..#113 hardening
+      # series for e2e validation against the control plane.
+      url = "github:EnclaviaIO/enclavia/af93a8522517d6f9d5b1634c4bfcc765949ba71a";
     };
   };
 
@@ -191,6 +191,28 @@
             name = "nbd-vsock-support";
             patch = ./nix/nbd-vsock.patch;
           }];
+        };
+
+        # aarch64 (Graviton) base profile, cross-built from this x86_64 host
+        # from the same kernel source.  Consumers assemble their own aarch64
+        # EIFs from `Image` and `config`; see docs/kernel.md.
+        aarch64Cross = pkgs.pkgsCross.aarch64-multiplatform;
+        enclaveKernelConfigAarch64 = pkgs.callPackage ./nix/kernel-config.nix {
+          kernel = kernelSource;
+          kernelArch = "aarch64";
+          crossCc = aarch64Cross.stdenv.cc;
+        };
+        enclaveKernelAarch64 = aarch64Cross.linuxManualConfig {
+          version = kernelSource.version;
+          src = kernelSource.src;
+          configfile = "${enclaveKernelConfigAarch64}/config";
+          allowImportFromDerivation = true;
+        };
+
+        # Static aarch64 build of the EIF init (nix/init-patched) for the
+        # same consumers.
+        eifInitAarch64 = pkgs.callPackage ./nix/eif-init-static-cross.nix {
+          goArch = "arm64";
         };
 
         # Builds the two bzImages and representative EIFs, then records their
@@ -1056,6 +1078,9 @@
           enclave-storage-kernel = storageKernel;
           enclave-kernel-config = enclaveKernelConfig;
           enclave-storage-kernel-config = storageKernelConfig;
+          enclave-kernel-aarch64 = enclaveKernelAarch64;
+          enclave-kernel-config-aarch64 = enclaveKernelConfigAarch64;
+          eif-init-aarch64 = eifInitAarch64;
           kernel-size-report = kernelSizeReport;
           default = builder;
         };
