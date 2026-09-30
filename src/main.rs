@@ -19,6 +19,8 @@ enum Error {
     Json(#[from] serde_json::Error),
     #[error("invalid generated OCI archive: {0}")]
     OciArchive(String),
+    #[error("invalid flags: {0}")]
+    Flags(String),
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -42,7 +44,15 @@ const SENSITIVE_COMMAND_FLAGS: &[&str] = &[
 enum Cli {
     /// Build an EIF from a Docker image
     Build {
-        /// Docker image reference (e.g. registry.enclavia.io/customer/app:tag)
+        /// Docker image reference (e.g. registry.enclavia.io/customer/app:tag).
+        /// A plain reference is pulled from its registry. An explicit
+        /// skopeo transport selects a non-registry source instead:
+        /// `docker-daemon:app:tag` (local Docker daemon),
+        /// `docker-archive:app.tar` (a `docker save` tarball), `oci:dir`
+        /// / `oci-archive:file`, or `containers-storage:` (podman).
+        /// Non-registry sources reject the registry auth flags and skip
+        /// digest pinning — they are for local builds (`enclavia build`),
+        /// not production.
         #[arg(long)]
         image: String,
 
@@ -262,9 +272,30 @@ async fn pull_image(
     registry_token: Option<&str>,
     image_digest: Option<&str>,
 ) -> Result<()> {
-    let source_image = image_reference_for_pull(image, image_digest);
-    let src = format!("docker://{source_image}");
     let dst = format!("oci:{}:latest", dest.display());
+
+    // A non-registry source (local daemon, tarball, OCI layout) is named
+    // by an explicit skopeo transport and copied verbatim. Registry auth
+    // flags are meaningless there, and `--override-os/arch` is skipped
+    // because these sources hold exactly one image, not a multi-arch
+    // index to resolve. `enclavia build` uses this for local CI builds;
+    // the backend always passes a plain registry reference.
+    if let Some(src) = local_transport_reference(image) {
+        if creds.is_some() || registry_token.is_some() {
+            return Err(Error::Flags(format!(
+                "registry credentials cannot be combined with the non-registry image source `{image}`"
+            )));
+        }
+        run_cmd("skopeo", &["copy", src, &dst]).await?;
+        info!(image, "image copied successfully");
+        return Ok(());
+    }
+
+    // Tolerate a spelled-out `docker://` prefix: it names the registry
+    // transport we were going to use anyway.
+    let bare = image.strip_prefix("docker://").unwrap_or(image);
+    let source_image = image_reference_for_pull(bare, image_digest);
+    let src = format!("docker://{source_image}");
 
     // EIFs currently boot an x86_64 Linux kernel. Select that platform
     // explicitly so a multi-arch tag/index cannot resolve according to the
@@ -280,7 +311,7 @@ async fn pull_image(
     ];
 
     // Disable TLS verification for localhost registries (dev/test).
-    if image.starts_with("localhost:") || image.starts_with("127.0.0.1:") {
+    if bare.starts_with("localhost:") || bare.starts_with("127.0.0.1:") {
         args.push("--src-tls-verify=false");
     }
 
@@ -297,6 +328,26 @@ async fn pull_image(
     run_cmd("skopeo", &args).await?;
     info!(image, "image pulled successfully");
     Ok(())
+}
+
+/// Return `image` as a skopeo source reference when it names a
+/// non-registry transport explicitly, `None` for a plain registry
+/// reference. `docker://` is deliberately not in the list: it IS the
+/// registry transport, so a reference carrying it takes the normal
+/// registry path (digest pinning, auth, arch override) — the prefix is
+/// just already spelled out.
+fn local_transport_reference(image: &str) -> Option<&str> {
+    const LOCAL_TRANSPORTS: &[&str] = &[
+        "docker-daemon:",
+        "docker-archive:",
+        "oci:",
+        "oci-archive:",
+        "containers-storage:",
+    ];
+    LOCAL_TRANSPORTS
+        .iter()
+        .any(|t| image.starts_with(t))
+        .then_some(image)
 }
 
 /// Return the registry reference skopeo should pull.
@@ -1120,6 +1171,28 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_transports_are_detected() {
+        for src in [
+            "docker-daemon:myapp:dev",
+            "docker-archive:/tmp/app.tar",
+            "oci:/tmp/layout:latest",
+            "oci-archive:/tmp/app.oci.tar",
+            "containers-storage:myapp:dev",
+        ] {
+            assert_eq!(local_transport_reference(src), Some(src));
+        }
+    }
+
+    #[test]
+    fn registry_references_are_not_local_transports() {
+        // `docker://` is the registry transport, not a local source; a
+        // plain reference (with or without port/tag) is registry too.
+        assert_eq!(local_transport_reference("docker://reg.example/app:v1"), None);
+        assert_eq!(local_transport_reference("registry.enclavia.io/acme/app:tag"), None);
+        assert_eq!(local_transport_reference("localhost:5000/app:dev"), None);
+    }
 
     #[test]
     fn command_log_redacts_separate_registry_secret_values() {
