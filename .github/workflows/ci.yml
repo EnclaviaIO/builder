@@ -103,6 +103,15 @@ jobs:
           .#test-enclave
           .#test-enclave-storage
 
+      # Resolve and cross-compile the aarch64 base kernel exported for the
+      # synchronizer's Graviton EIF.  The cross toolchain is substituted
+      # from cache.nixos.org; only the kernel itself is compiled here.
+      - name: build aarch64 base kernel (cross)
+        run: >-
+          nix build --no-link
+          .#enclave-kernel-config-aarch64
+          .#enclave-kernel-aarch64
+
       - name: record kernel and EIF sizes
         run: |
           nix build .#kernel-size-report -o result-kernel-size-report
