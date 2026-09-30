@@ -111,6 +111,7 @@ jobs:
           nix build --no-link
           .#enclave-kernel-config-aarch64
           .#enclave-kernel-aarch64
+          .#eif-init-aarch64
 
       - name: record kernel and EIF sizes
         run: |

@@ -207,6 +207,7 @@ cross build from x86_64:
 |---|---|
 | `packages.x86_64-linux.enclave-kernel-aarch64` | `Image`, `System.map` |
 | `packages.x86_64-linux.enclave-kernel-config-aarch64` | `config`, `seed`, `report` |
+| `packages.x86_64-linux.eif-init-aarch64` | `bin/init`: the EIF init from `nix/init-patched`, statically linked |
 
 Output names select profile and architecture: `enclave-` is the base profile
 and `enclave-storage-` the storage profile; x86_64 outputs have no suffix and
@@ -222,6 +223,7 @@ nitroLib.buildEif {
   kernel = "${kernel}/Image";
   kernelConfig = "${kernelConfig}/config";
   nsmKo = null; # NSM is built in
+  init = "${builder.packages.x86_64-linux.eif-init-aarch64}/bin/init";
   # ...
 }
 ```

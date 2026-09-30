@@ -209,6 +209,12 @@
           allowImportFromDerivation = true;
         };
 
+        # Static aarch64 build of the EIF init (nix/init-patched) for the
+        # same consumers.
+        eifInitAarch64 = pkgs.callPackage ./nix/eif-init-static-cross.nix {
+          goArch = "arm64";
+        };
+
         # Builds the two bzImages and representative EIFs, then records their
         # byte sizes alongside the retired Linux 4.14 non-storage blob.
         # Storage's before/after comparison requires a separate build of the
@@ -1074,6 +1080,7 @@
           enclave-storage-kernel-config = storageKernelConfig;
           enclave-kernel-aarch64 = enclaveKernelAarch64;
           enclave-kernel-config-aarch64 = enclaveKernelConfigAarch64;
+          eif-init-aarch64 = eifInitAarch64;
           kernel-size-report = kernelSizeReport;
           default = builder;
         };
