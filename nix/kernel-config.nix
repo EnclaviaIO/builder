@@ -10,14 +10,49 @@
   xz,
   kernel,
   storage ? false,
+  # Target architecture: "x86_64" (native) or "aarch64" (cross-resolved).
+  kernelArch ? "x86_64",
+  # aarch64 only: the cross C compiler (pkgsCross.aarch64-multiplatform
+  # .stdenv.cc).  Kconfig probes compiler features with cc-option, so the
+  # policy must be resolved with the compiler that builds the kernel.
+  crossCc ? null,
 }:
 
 let
   profile = if storage then "storage" else "base";
-  builtInBudget = if storage then 669 else 619;
 
-  seed = writeText "enclavia-${profile}-kernel.seed" (
-    builtins.readFile ./enclave-kernel.config
+  archSpecs = {
+    x86_64 = {
+      makeArch = "x86_64";
+      seedFile = ./enclave-kernel.config;
+      budgets = { base = 619; storage = 669; };
+    };
+    aarch64 = {
+      makeArch = "arm64";
+      seedFile = ./enclave-kernel-aarch64.config;
+      # No aarch64 storage profile: its only consumer is the synchronizer.
+      budgets = { base = 500; };
+    };
+  };
+
+  spec = archSpecs.${kernelArch}
+    or (throw "kernel-config.nix: unsupported kernelArch '${kernelArch}' (expected x86_64 or aarch64)");
+  isX86 = kernelArch == "x86_64";
+
+  builtInBudget = spec.budgets.${profile}
+    or (throw "kernel-config.nix: there is no ${profile} kernel profile for ${kernelArch}");
+
+  crossCompile =
+    if isX86 then ""
+    else if crossCc == null then throw "kernel-config.nix: ${kernelArch} requires crossCc"
+    else " CROSS_COMPILE=${crossCc.targetPrefix}";
+
+  # x86_64 keeps its unprefixed names so its store paths, and therefore the
+  # measured EIFs, do not depend on the architecture support added here.
+  namePrefix = if isX86 then "enclavia-${profile}" else "enclavia-${kernelArch}-${profile}";
+
+  seed = writeText "${namePrefix}-kernel.seed" (
+    builtins.readFile spec.seedFile
     + lib.optionalString storage ("\n" + builtins.readFile ./enclave-storage-kernel.config)
   );
 
@@ -33,12 +68,13 @@ let
     "CONFIG_BTRFS_FS"
   ];
 
-  forbidden = writeText "enclavia-${profile}-kernel.forbidden" (
+  forbidden = writeText "${namePrefix}-kernel.forbidden" (
     lib.concatStringsSep "\n" profileForbidden + "\n"
   );
 in
-runCommand "enclavia-${profile}-kernel-config-${kernel.version}" {
-  nativeBuildInputs = [ stdenv.cc bison flex gnumake gnutar xz ];
+runCommand "${namePrefix}-kernel-config-${kernel.version}" {
+  nativeBuildInputs = [ stdenv.cc bison flex gnumake gnutar xz ]
+    ++ lib.optional (!isX86) crossCc;
 } ''
   set -eu
 
@@ -54,7 +90,7 @@ runCommand "enclavia-${profile}-kernel-config-${kernel.version}" {
   # A complete allnoconfig result prevents new upstream default-y options from
   # entering an enclave unnoticed when the pinned maintained kernel advances.
   KCONFIG_ALLCONFIG=${seed} \
-    make -C source O="$PWD/build" ARCH=x86_64 allnoconfig
+    make -C source O="$PWD/build" ARCH=${spec.makeArch}${crossCompile} allnoconfig
 
   # A requested capability that was renamed or lost a dependency must fail
   # loudly.  Disabled lines accept either an explicit "not set" entry or an
@@ -102,12 +138,12 @@ runCommand "enclavia-${profile}-kernel-config-${kernel.version}" {
   cp build/.config "$out/config"
   cp ${seed} "$out/seed"
   {
-    echo "profile=${profile}"
+    ${lib.optionalString (!isX86) "echo \"arch=${kernelArch}\"\n    "}echo "profile=${profile}"
     echo "kernel-version=${kernel.version}"
     echo "built-in-options=$built_ins"
     echo "module-options=$modules"
     echo "built-in-option-budget=${toString builtInBudget}"
   } > "$out/report"
 
-  echo "enclavia ${profile} kernel: $built_ins built-ins, $modules modules; budget=${toString builtInBudget}"
+  echo "enclavia ${lib.optionalString (!isX86) "${kernelArch} "}${profile} kernel: $built_ins built-ins, $modules modules; budget=${toString builtInBudget}"
 ''

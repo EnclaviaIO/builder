@@ -14,6 +14,11 @@ generator then fails if a requested option did not resolve, a forbidden option
 resolved to `y` or `m`, any module exists, or the resolved built-in count exceeds
 619 for base / 669 for storage.
 
+The generator takes a `kernelArch` argument, `x86_64` (the default) or
+`aarch64`. The x86_64 policy and everything below up to
+[aarch64 (Graviton) base profile](#aarch64-graviton-base-profile) describe the
+x86_64 kernels that this repository's own EIFs use.
+
 ## Required and retained capabilities
 
 | Capability | Profile | Why it is retained |
@@ -136,3 +141,119 @@ sh nix/size-report.sh \
 
 Do not compare NAR closure sizes: the relevant attack-surface and delivery
 metrics are the compressed `bzImage` embedded in the EIF and `image.eif` itself.
+
+## aarch64 (Graviton) base profile
+
+The synchronizer's Graviton (c7g/c8g) Nitro Enclaves use an aarch64 build of
+the base profile. This repository does not assemble aarch64 EIFs itself; it
+exports the kernel and its resolved config for consumers such as the enclavia
+repository's synchronizer EIF.
+
+There is no aarch64 storage profile. Its only consumer is the synchronizer,
+which does not use NBD, dm-crypt or Btrfs, so `kernelArch = "aarch64"` with
+`storage = true` fails at evaluation. Adding one would need its own review of
+the storage options on arm64.
+
+### How it is built
+
+Both the config and the kernel are cross-built on the x86_64 builder with
+nixpkgs' `pkgsCross.aarch64-multiplatform` GCC, from the same pinned
+`linuxPackages_latest` source as the x86_64 kernels. The cross build is the
+canonical, reproducible build: its output is what the measured PCRs are
+computed from, and a native aarch64 build is not expected to be bit-identical.
+The policy is resolved with `make ARCH=arm64 CROSS_COMPILE=... allnoconfig`,
+because Kconfig probes compiler features (`cc-option`) and those probes must
+see the compiler that builds the kernel. The same request, forbidden-option,
+no-module and built-in budget checks apply; the resolved config has 500
+built-ins and no modules, and the budget is 500.
+
+The seed is `nix/enclave-kernel-aarch64.config`. It is a complete seed rather
+than a fragment on top of `nix/enclave-kernel.config`, because the x86_64 seed
+mixes x86-only lines into its common sections, and keeping that file unchanged
+keeps the x86_64 store paths and EIF measurements unchanged. Sections without
+an `arm64:` note are the architecture-neutral policy; a change to the neutral
+sections of one seed must be made in the other seed too.
+
+### What differs from x86_64, and why
+
+| Area | x86_64 | aarch64 | Why |
+|---|---|---|---|
+| Kernel image | XZ-compressed `bzImage`, 16 MiB `PHYSICAL_ALIGN` | uncompressed `Image` | the arm64 enclave firmware loads a plain `Image`; there is no self-decompressor, so `KERNEL_XZ` and the bzImage initrd-placement constraint do not apply |
+| Firmware and device discovery | ACPI/MP tables; virtio-mmio devices passed as `virtio_mmio.device=` arguments | device tree only (`linux,dummy-virt`); `ACPI` and `EFI` off; `VIRTIO_MMIO_CMDLINE_DEVICES` off | the Nitro arm64 enclave firmware provides no ACPI tables and no UEFI; the UART, RTC and virtio-mmio devices (NSM, vsock) are all device-tree nodes |
+| Console | 8250 at the legacy I/O port | 8250 via `SERIAL_OF_PLATFORM` | the UART is a device-tree MMIO node at `0x40001000` |
+| Wall clock | kvm-clock | PL031 RTC: `RTC_CLASS`, `RTC_HCTOSYS`, `RTC_DRV_PL031` | **required**: arm64 KVM has no paravirtual wall clock. Without the PL031 driver the enclave boots at 1970 and X.509 validity checks during attestation verification fail |
+| CPU mitigations | `MITIGATION_*` set | `UNMAP_KERNEL_AT_EL0`, `MITIGATE_SPECTRE_BRANCH_HISTORY` | arm64 equivalents of page-table isolation and branch-history defenses |
+| Hardware hardening | none | `ARM64_PTR_AUTH` (+ `_KERNEL`), `ARM64_BTI` (userspace), `ARM64_E0PD`, `ARM64_EPAN` | active inside a Nitro enclave only where both the CPU and the hypervisor expose them (see below). `ARM64_BTI_KERNEL` is unavailable with GCC |
+| Errata | none | `ARM64_ERRATUM_3194386`, `ARM64_ERRATUM_4118414` | Neoverse-V1/V2 workarounds that are default-y upstream but dropped by `allnoconfig` |
+| Pages and address space | fixed by x86_64 | 4K pages, 48-bit VA, 48-bit PA | see below |
+| 32-bit ABI | `IA32_EMULATION`, `X86_X32_ABI` off | `COMPAT` off | no 32-bit userspace |
+
+What is actually active inside a Nitro enclave, observed on real hardware
+(boot log and `/proc/cpuinfo` in the enclave):
+
+| Feature | Graviton4 (c8g, Neoverse-V2) | Graviton3 (c7g, Neoverse-V1) |
+|---|---|---|
+| BTI, E0PD, EPAN | active | absent (the CPU does not implement them; without E0PD, KASLR forces KPTI on) |
+| Pointer authentication | off | off |
+| Spectre-BHB mitigation | active | active |
+
+Pointer authentication is off in the enclave on both, although the parent
+instance's kernel detects it on the same machines: the Nitro enclave
+hypervisor does not expose it to enclaves. `ARM64_PTR_AUTH` stays enabled
+because it costs nothing and activates if the feature is ever exposed.
+
+`ARM64_VA_BITS` is pinned to 48 (and `ARM64_PA_BITS` to 48); `allnoconfig`
+would otherwise pick the 52-bit default. 52-bit virtual addresses with 4K pages
+need FEAT_LPA2, which Neoverse-V1/V2 do not implement, so the kernel would fall
+back to 48 bits at runtime while still carrying the LPA2 and five-level
+page-table code. Upstream also warns that 52-bit VA reduces the pointer
+authentication code from 7 to 3 bits. 48 bits gives 256 TiB of virtual address
+space, far more than any enclave has. Compared with the 52-bit default, the only
+resolved-config changes are the VA/PA bit counts, `ARM64_LPA2` off and
+`PGTABLE_LEVELS` 5 to 4.
+
+### Consuming the aarch64 kernel
+
+The outputs exist only for the `x86_64-linux` system, because the build is a
+cross build from x86_64:
+
+| Output | Contents |
+|---|---|
+| `packages.x86_64-linux.enclave-kernel-aarch64` | `Image`, `System.map` |
+| `packages.x86_64-linux.enclave-kernel-config-aarch64` | `config`, `seed`, `report` |
+| `packages.x86_64-linux.eif-init-aarch64` | `bin/init`: the EIF init from `nix/init-patched`, statically linked |
+
+Output names select profile and architecture: `enclave-` is the base profile
+and `enclave-storage-` the storage profile; x86_64 outputs have no suffix and
+aarch64 outputs end in `-aarch64`. The only aarch64 pair is the base profile.
+With nitro-util's `buildEif`:
+
+```nix
+kernel = builder.packages.x86_64-linux.enclave-kernel-aarch64;
+kernelConfig = builder.packages.x86_64-linux.enclave-kernel-config-aarch64;
+
+nitroLib.buildEif {
+  arch = "aarch64";
+  kernel = "${kernel}/Image";
+  kernelConfig = "${kernelConfig}/config";
+  nsmKo = null; # NSM is built in
+  init = "${builder.packages.x86_64-linux.eif-init-aarch64}/bin/init";
+  # ...
+}
+```
+
+The kernel command line used for x86_64 EIFs also works on arm64.
+
+### Verification
+
+```sh
+nix build .#packages.x86_64-linux.enclave-kernel-config-aarch64 \
+  -o result-aarch64-kernel-config
+cat result-aarch64-kernel-config/report
+nix build .#packages.x86_64-linux.enclave-kernel-aarch64 \
+  -o result-aarch64-kernel
+```
+
+Boot coverage is on real Graviton Nitro hardware, through the consumer's EIF;
+this repository has no aarch64 QEMU harness. A successful boot logs
+`rtc-pl031 ... setting system clock to <current date>` and exposes `/dev/nsm`.
