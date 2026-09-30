@@ -193,6 +193,22 @@
           }];
         };
 
+        # aarch64 (Graviton) base profile, cross-built from this x86_64 host
+        # from the same kernel source.  Consumers assemble their own aarch64
+        # EIFs from `Image` and `config`; see docs/kernel.md.
+        aarch64Cross = pkgs.pkgsCross.aarch64-multiplatform;
+        enclaveKernelConfigAarch64 = pkgs.callPackage ./nix/kernel-config.nix {
+          kernel = kernelSource;
+          kernelArch = "aarch64";
+          crossCc = aarch64Cross.stdenv.cc;
+        };
+        enclaveKernelAarch64 = aarch64Cross.linuxManualConfig {
+          version = kernelSource.version;
+          src = kernelSource.src;
+          configfile = "${enclaveKernelConfigAarch64}/config";
+          allowImportFromDerivation = true;
+        };
+
         # Builds the two bzImages and representative EIFs, then records their
         # byte sizes alongside the retired Linux 4.14 non-storage blob.
         # Storage's before/after comparison requires a separate build of the
@@ -1056,6 +1072,8 @@
           enclave-storage-kernel = storageKernel;
           enclave-kernel-config = enclaveKernelConfig;
           enclave-storage-kernel-config = storageKernelConfig;
+          enclave-kernel-aarch64 = enclaveKernelAarch64;
+          enclave-kernel-config-aarch64 = enclaveKernelConfigAarch64;
           kernel-size-report = kernelSizeReport;
           default = builder;
         };
