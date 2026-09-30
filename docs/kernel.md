@@ -183,10 +183,24 @@ sections of one seed must be made in the other seed too.
 | Console | 8250 at the legacy I/O port | 8250 via `SERIAL_OF_PLATFORM` | the UART is a device-tree MMIO node at `0x40001000` |
 | Wall clock | kvm-clock | PL031 RTC: `RTC_CLASS`, `RTC_HCTOSYS`, `RTC_DRV_PL031` | **required**: arm64 KVM has no paravirtual wall clock. Without the PL031 driver the enclave boots at 1970 and X.509 validity checks during attestation verification fail |
 | CPU mitigations | `MITIGATION_*` set | `UNMAP_KERNEL_AT_EL0`, `MITIGATE_SPECTRE_BRANCH_HISTORY` | arm64 equivalents of page-table isolation and branch-history defenses |
-| Hardware hardening | none | `ARM64_PTR_AUTH` (+ `_KERNEL`), `ARM64_BTI` (userspace), `ARM64_E0PD`, `ARM64_EPAN` | Graviton3 (Neoverse-V1) and Graviton4 (Neoverse-V2) implement these. `ARM64_BTI_KERNEL` is unavailable with GCC |
+| Hardware hardening | none | `ARM64_PTR_AUTH` (+ `_KERNEL`), `ARM64_BTI` (userspace), `ARM64_E0PD`, `ARM64_EPAN` | active inside a Nitro enclave only where both the CPU and the hypervisor expose them (see below). `ARM64_BTI_KERNEL` is unavailable with GCC |
 | Errata | none | `ARM64_ERRATUM_3194386`, `ARM64_ERRATUM_4118414` | Neoverse-V1/V2 workarounds that are default-y upstream but dropped by `allnoconfig` |
 | Pages and address space | fixed by x86_64 | 4K pages, 48-bit VA, 48-bit PA | see below |
 | 32-bit ABI | `IA32_EMULATION`, `X86_X32_ABI` off | `COMPAT` off | no 32-bit userspace |
+
+What is actually active inside a Nitro enclave, observed on real hardware
+(boot log and `/proc/cpuinfo` in the enclave):
+
+| Feature | Graviton4 (c8g, Neoverse-V2) | Graviton3 (c7g, Neoverse-V1) |
+|---|---|---|
+| BTI, E0PD, EPAN | active | absent (the CPU does not implement them; without E0PD, KASLR forces KPTI on) |
+| Pointer authentication | off | off |
+| Spectre-BHB mitigation | active | active |
+
+Pointer authentication is off in the enclave on both, although the parent
+instance's kernel detects it on the same machines: the Nitro enclave
+hypervisor does not expose it to enclaves. `ARM64_PTR_AUTH` stays enabled
+because it costs nothing and activates if the feature is ever exposed.
 
 `ARM64_VA_BITS` is pinned to 48 (and `ARM64_PA_BITS` to 48); `allnoconfig`
 would otherwise pick the 52-bit default. 52-bit virtual addresses with 4K pages
