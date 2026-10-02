@@ -107,6 +107,11 @@
         # come from `enclavia-crates` further below.
         enclaviaServerPkg = enclavia.packages.${system}.enclavia-server;
         nbdClientPkg = enclavia.packages.${system}.nbd-client;
+        # Debug-image (QEMU) builds with the skip-chain path; `-debug` targets
+        # only. They exist from enclavia's Train 2 release (EnclaviaIO/enclavia#119)
+        # on, so these targets need ENCLAVIA_FLAKE at that release or later.
+        enclaviaServerDebugPkg = enclavia.packages.${system}.enclavia-server-debug;
+        nbdClientDebugPkg = enclavia.packages.${system}.nbd-client-debug;
         enclaviaCryptoPkg = enclavia.packages.${system}.enclavia-crypto;
         enclaviaEgressPkg = enclavia.packages.${system}.enclavia-egress;
         enclaviaSecretsInitPkg = enclavia.packages.${system}.enclavia-secrets-init;
@@ -248,15 +253,24 @@
         # Keep the production feature matrix in one recipe. The unsuffixed
         # targets are deny-all and contain no egress stack; `-egress` targets
         # opt in explicitly when the builder receives --egress-allowlist.
-        # Debug-attestation trust is encoded in the measured OCI payload
-        # before this recipe is called, so it is not a separate Nix target.
+        #
+        # `-debug` targets (the builder's `--debug`, QEMU) carry enclavia's
+        # debug builds of nbd-client and enclavia-server, the only builds
+        # with the path that checks the synchronizer's attestation without
+        # the AWS Nitro certificate chain. Production targets carry the
+        # builds without it. The measured config's
+        # `synchronizer.debug_attestation` (also from `--debug`) must match:
+        # each binary refuses to start otherwise.
         mkProductionEnclave = {
           storageEnabled ? false,
           egressEnabled ? false,
           rootfsOnly ? false,
+          debug ? false,
         }: pkgs.callPackage ./nix/enclave.nix {
-          inherit pkgs nitroLib enclaviaServerPkg nbdClientPkg enclaviaCryptoPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
+          inherit pkgs nitroLib enclaviaCryptoPkg enclaviaSecretsInitPkg enclaviaChainInitPkg;
           inherit ociBundleArchive storageEnabled egressEnabled rootfsOnly;
+          enclaviaServerPkg = if debug then enclaviaServerDebugPkg else enclaviaServerPkg;
+          nbdClientPkg = if debug then nbdClientDebugPkg else nbdClientPkg;
           enclaviaEgressPkg = if egressEnabled then enclaviaEgressPkg else null;
           customKernel = if storageEnabled then storageKernel else enclaveKernel;
         };
@@ -267,6 +281,20 @@
         enclave-storage-egress = mkProductionEnclave {
           storageEnabled = true;
           egressEnabled = true;
+        };
+        enclave-debug = mkProductionEnclave { debug = true; };
+        enclave-storage-debug = mkProductionEnclave {
+          storageEnabled = true;
+          debug = true;
+        };
+        enclave-egress-debug = mkProductionEnclave {
+          egressEnabled = true;
+          debug = true;
+        };
+        enclave-storage-egress-debug = mkProductionEnclave {
+          storageEnabled = true;
+          egressEnabled = true;
+          debug = true;
         };
 
         # --- Uncompressed rootfs size budgets -------------------------
@@ -1073,7 +1101,7 @@
         };
 
         packages = {
-          inherit builder enclave enclave-egress enclave-storage enclave-storage-egress debug-vm test-bundle test-enclave test-debug-vm test-storage-bundle test-enclave-storage test-enclave-storage-no-luks test-storage-vm test-egress-bundle test-enclave-egress test-egress-vm test-ws-bundle test-enclave-ws test-secrets-bundle test-enclave-secrets test-secrets-vm;
+          inherit builder enclave enclave-egress enclave-storage enclave-storage-egress enclave-debug enclave-egress-debug enclave-storage-debug enclave-storage-egress-debug debug-vm test-bundle test-enclave test-debug-vm test-storage-bundle test-enclave-storage test-enclave-storage-no-luks test-storage-vm test-egress-bundle test-enclave-egress test-egress-vm test-ws-bundle test-enclave-ws test-secrets-bundle test-enclave-secrets test-secrets-vm;
           enclave-kernel = enclaveKernel;
           enclave-storage-kernel = storageKernel;
           enclave-kernel-config = enclaveKernelConfig;
