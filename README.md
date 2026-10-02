@@ -38,7 +38,7 @@ Flags (see `src/main.rs` for the source of truth):
 | `--registry-token` | Pre-minted bearer token; bypasses the auth realm round-trip. Mutually exclusive with the user/password pair. |
 | `--output-dir` | Directory to write `image.eif` and `pcr.json` (default `./out`). |
 | `--container-port` | Port the customer's container listens on inside the enclave (default `8080`). |
-| `--debug` | Build with debug-attestation trust anchors for local QEMU testing. All profiles use the same dual Nitro/QEMU heartbeat init. See [docs/debug-mode.md](docs/debug-mode.md). |
+| `--debug` | Build with debug-attestation trust anchors for local QEMU testing, from the `-debug` Nix targets (enclavia's debug builds of nbd-client and enclavia-server, the only ones that can skip the synchronizer's certificate chain). All profiles use the same dual Nitro/QEMU heartbeat init. See [docs/debug-mode.md](docs/debug-mode.md). |
 | `--storage` | Build the storage-capable variant (LUKS + Btrfs over NBD over vsock). Adds the minimal storage kernel profile and `enclavia-crypto`. |
 | `--control-pubkey` | Base64-encoded ECDSA P-256 public key (65 raw bytes, uncompressed SEC1) for the management control channel. |
 | `--enclave-id` | Per-enclave identifier stamped into `enclavia-config.json`, so two enclaves built from identical inputs still get distinct PCRs. |
