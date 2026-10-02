@@ -28,9 +28,15 @@ Debug mode addresses these by:
    services can connect to without depending on the kernel's
    `vhost_vsock` module.
 
-`builder build --debug` changes the measured debug-attestation trust setting;
-it does not swap the kernel or init. Consequently the same purpose-built EIF
-boot path works on real Nitro and in the QEMU harness.
+`builder build --debug` changes the measured debug-attestation trust setting
+and builds the `-debug` Nix target, which carries enclavia's debug builds of
+nbd-client and enclavia-server: the only builds that can check the
+synchronizer's attestation without the AWS Nitro certificate chain (QEMU's
+NSM self-signs). Production images carry the builds without that path, and
+each binary refuses to start if the measured `synchronizer.debug_attestation`
+disagrees with its build. `--debug` does not swap the kernel or init.
+Consequently the same purpose-built EIF boot path works on real Nitro and in
+the QEMU harness.
 
 ## Data path: router to guest
 
