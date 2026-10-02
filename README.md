@@ -46,6 +46,7 @@ Flags (see `src/main.rs` for the source of truth):
 | `--egress-allowlist` | Path to the egress allowlist JSON. Its presence enables the measured egress stack and bakes the policy at `/etc/enclavia/egress.json`; absent means deny-all and omits the stack entirely. |
 | `--synchronizer-pcrs` | Synchronizer trust anchors for the storage anti-rollback wiring: a pcr.json path or inline JSON carrying one or more `{PCR0,PCR1,PCR2}` hex triples. Written into `enclavia-config.json` as `synchronizer.expected_pcrs` together with `debug_attestation` (mirrors `--debug`); when absent no `synchronizer` section is written. |
 | `--synchronizer-enabled` | Turn the anti-rollback wiring ON: writes `synchronizer.enabled = true`, which the EIF init reads to export `SYNCHRONIZER_ENABLED=1` for the in-enclave nbd-client. Requires `--synchronizer-pcrs` (an enabled wiring with no expected oracle PCRs fail-stops at boot). Omit to bake the anchors disabled (flip on with a later rebuild). |
+| `--upgrade-target` | Mark the image as the target of an upgrade: writes `synchronizer.upgrade_target = true`. The in-enclave nbd-client then never registers a fresh volume with the synchronizer; it obtains its pin only by the Transition out of the version it upgrades, and fail-stops otherwise. The backend passes it for staged-upgrade builds of enclaves whose running version has the synchronizer wiring on, never for an enclave's first image. Requires `--synchronizer-pcrs`. |
 
 ## What it produces
 

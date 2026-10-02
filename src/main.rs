@@ -161,6 +161,21 @@ enum Cli {
         #[arg(long)]
         synchronizer_enabled: bool,
 
+        /// Mark this image as the target of an upgrade (enclavia train 2):
+        /// stamp `synchronizer.upgrade_target = true` into the measured
+        /// config. The in-enclave nbd-client then never registers a fresh
+        /// volume with the synchronizer: it obtains its pin only by the
+        /// Transition out of the version it upgrades, and fail-stops
+        /// otherwise. Without it, a host could boot the upgrade target on a
+        /// blank disk once the upgrade link exists, have it register and
+        /// serve an empty volume, and block the real Transition for good.
+        /// The backend passes it for staged-upgrade builds whose running
+        /// version has the synchronizer wiring on; never for an enclave's
+        /// first image. REQUIRES --synchronizer-pcrs (it lives in the
+        /// synchronizer section). Absent keeps the config bytes unchanged.
+        #[arg(long)]
+        upgrade_target: bool,
+
         /// Create-time immutable minimum upgrade activation delay in
         /// seconds (enclavia-crates#205). When set (and non-zero), the
         /// value is stamped into `enclavia-config.json`, which lands at
@@ -881,6 +896,7 @@ fn write_enclavia_config(
     image_digest: Option<&str>,
     synchronizer_pcrs: Option<&[PcrValues]>,
     synchronizer_enabled: bool,
+    upgrade_target: bool,
     min_upgrade_delay_secs: Option<u64>,
 ) -> Result<()> {
     let mut config = serde_json::json!({
@@ -935,6 +951,12 @@ fn write_enclavia_config(
             "expected_pcrs": pcrs,
             "debug_attestation": debug,
         });
+        // Upgrade target (enclavia train 2): this image obtains its pin only
+        // by a Transition and never registers. Written only when set, so a
+        // first image's config bytes do not change.
+        if upgrade_target {
+            config["synchronizer"]["upgrade_target"] = serde_json::Value::Bool(true);
+        }
     }
 
     // Minimum upgrade activation delay (enclavia-crates#205). Measured
@@ -958,6 +980,7 @@ fn write_enclavia_config(
         has_image_digest = image_digest.is_some(),
         synchronizer_pcr_sets = synchronizer_pcrs.map(<[_]>::len).unwrap_or(0),
         synchronizer_enabled,
+        upgrade_target,
         min_upgrade_delay_secs = min_upgrade_delay_secs.unwrap_or(0),
         "wrote enclavia config"
     );
@@ -979,6 +1002,7 @@ async fn build(
     egress_allowlist: Option<&Path>,
     synchronizer_pcrs: Option<&[PcrValues]>,
     synchronizer_enabled: bool,
+    upgrade_target: bool,
     min_upgrade_delay_secs: Option<u64>,
 ) -> Result<BuildResult> {
     let tmp = tempfile::tempdir()?;
@@ -1013,6 +1037,7 @@ async fn build(
         image_digest,
         synchronizer_pcrs,
         synchronizer_enabled,
+        upgrade_target,
         min_upgrade_delay_secs,
     )?;
 
@@ -1094,6 +1119,7 @@ async fn main() {
             egress_allowlist,
             synchronizer_pcrs,
             synchronizer_enabled,
+            upgrade_target,
             min_upgrade_delay_secs,
         } => {
             let creds = match (&registry_user, &registry_password) {
@@ -1137,6 +1163,16 @@ async fn main() {
                 std::process::exit(2);
             }
 
+            // The marker lives in the synchronizer section, which only exists
+            // with anchors.
+            if upgrade_target && synchronizer_pcrs.is_none() {
+                error!(
+                    "--upgrade-target requires --synchronizer-pcrs (the marker is part of the \
+                     measured synchronizer section)"
+                );
+                std::process::exit(2);
+            }
+
             match build(
                 &image,
                 creds,
@@ -1151,6 +1187,7 @@ async fn main() {
                 egress_allowlist.as_deref(),
                 synchronizer_pcrs.as_deref(),
                 synchronizer_enabled,
+                upgrade_target,
                 min_upgrade_delay_secs,
             )
             .await
@@ -1436,6 +1473,24 @@ mod tests {
         synchronizer_enabled: bool,
         min_upgrade_delay_secs: Option<u64>,
     ) -> serde_json::Value {
+        written_config_full(
+            debug,
+            storage,
+            synchronizer_pcrs,
+            synchronizer_enabled,
+            false,
+            min_upgrade_delay_secs,
+        )
+    }
+
+    fn written_config_full(
+        debug: bool,
+        storage: bool,
+        synchronizer_pcrs: Option<&[PcrValues]>,
+        synchronizer_enabled: bool,
+        upgrade_target: bool,
+        min_upgrade_delay_secs: Option<u64>,
+    ) -> serde_json::Value {
         let dir = tempfile::tempdir().unwrap();
         write_enclavia_config(
             dir.path(),
@@ -1447,6 +1502,7 @@ mod tests {
             None,
             synchronizer_pcrs,
             synchronizer_enabled,
+            upgrade_target,
             min_upgrade_delay_secs,
         )
         .unwrap();
@@ -1514,6 +1570,22 @@ mod tests {
         // exports SYNCHRONIZER_ENABLED=1 for nbd-client.
         let on = written_config(false, true, Some(&triples), true);
         assert_eq!(on["synchronizer"]["enabled"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn config_upgrade_target_is_written_only_when_set() {
+        let triples = vec![triple('a')];
+        // The key nbd-client's RawSynchronizerSection reads.
+        let target = written_config_full(false, true, Some(&triples), true, true, None);
+        assert_eq!(
+            target["synchronizer"]["upgrade_target"],
+            serde_json::json!(true)
+        );
+        // A first image's config is byte-for-byte what it was before the
+        // flag existed.
+        let genesis = written_config_full(false, true, Some(&triples), true, false, None);
+        assert!(genesis["synchronizer"].get("upgrade_target").is_none());
+        assert_eq!(genesis, written_config(false, true, Some(&triples), true));
     }
 
     #[test]
