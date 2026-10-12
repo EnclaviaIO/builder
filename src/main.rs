@@ -672,12 +672,24 @@ async fn create_bundle_archive(
 /// and `ENCLAVIA_FLAKE` env vars; in dev the flake's defaults (`./dummy-*`)
 /// are replaced by passing `--override-input enclavia-crates path:...`
 /// and `--override-input enclavia path:...` to the QEMU wrapper.
-fn eif_target(storage: bool, egress_enabled: bool) -> &'static str {
-    match (storage, egress_enabled) {
+///
+/// `debug` (`--debug`, QEMU) selects the `-debug` targets, which carry the
+/// debug builds of nbd-client and enclavia-server: the only builds with the
+/// path that checks the synchronizer's attestation without the AWS Nitro
+/// certificate chain. Production images get the builds without it, and each
+/// binary refuses to start if the measured `synchronizer.debug_attestation`
+/// (also written from `--debug`) disagrees with its build.
+fn eif_target(storage: bool, egress_enabled: bool, debug: bool) -> String {
+    let base = match (storage, egress_enabled) {
         (false, false) => "enclave",
         (true, false) => "enclave-storage",
         (false, true) => "enclave-egress",
         (true, true) => "enclave-storage-egress",
+    };
+    if debug {
+        format!("{base}-debug")
+    } else {
+        base.to_string()
     }
 }
 
@@ -686,6 +698,7 @@ async fn build_eif(
     result_link: &Path,
     storage: bool,
     egress_enabled: bool,
+    debug: bool,
 ) -> Result<()> {
     let bundle_arg = format!("path:{}", bundle_input_dir.display());
     let out_arg = result_link.to_string_lossy();
@@ -706,7 +719,7 @@ async fn build_eif(
     // Storage variants add the custom kernel and storage userspace. Egress
     // variants add the outbound networking stack only when the caller supplied
     // an allowlist; deny-all images use the smaller default targets.
-    let target = eif_target(storage, egress_enabled);
+    let target = eif_target(storage, egress_enabled, debug);
     let flake_ref = format!("{}#{}", builder_dir.display(), target);
 
     let mut args: Vec<String> = vec![
@@ -1065,9 +1078,11 @@ async fn build(
     create_bundle_archive(&payload_dir, &archive_layout, &bundle_input_dir).await?;
 
     // 7. Build the EIF
+    let debug_image = debug;
     info!(
         storage,
         egress_enabled = egress_allowlist.is_some(),
+        debug_image,
         "building enclave image"
     );
     build_eif(
@@ -1075,6 +1090,7 @@ async fn build(
         &result_link,
         storage,
         egress_allowlist.is_some(),
+        debug,
     )
     .await?;
 
@@ -1286,7 +1302,7 @@ mod tests {
     }
 
     #[test]
-    fn eif_targets_cover_storage_and_egress_features() {
+    fn eif_targets_cover_storage_egress_and_debug() {
         let cases = [
             ((false, false), "enclave"),
             ((true, false), "enclave-storage"),
@@ -1295,7 +1311,8 @@ mod tests {
         ];
 
         for ((storage, egress), expected) in cases {
-            assert_eq!(eif_target(storage, egress), expected);
+            assert_eq!(eif_target(storage, egress, false), expected);
+            assert_eq!(eif_target(storage, egress, true), format!("{expected}-debug"));
         }
     }
 
